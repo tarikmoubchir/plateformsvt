@@ -258,7 +258,7 @@
         ds.manque > 0 && h("p", { class: "note ko" }, ds.manque + " exercice(s) demandé(s) n’ont pas pu être composés : la banque n’en contient pas assez pour ces concepts et cette durée."),
         h("div", { class: "stats" }, [["Durée estimée", ds.duree + " min"], ["Questions", all.length], ["Restitution", fr(ptI) + " pts (" + Math.round(ptI * 5) + " %)"], ["Raisonnement et communication", fr(ptII) + " pts (" + Math.round(ptII * 5) + " %)"]].map(s => h("div", { class: "stat" }, h("b", {}, s[1]), h("span", {}, s[0])))),
         h("div", { class: "btns" },
-          h("button", { class: "btn", onclick: () => download(buildPDF(renderSujet(ds), ds.p.titre || "Devoir surveille SVT"), "DS_SVT_sujet.pdf") }, "Télécharger le sujet (PDF)"),
+          h("button", { class: "btn", onclick: () => { S.journal && S.journal("Devoir surveillé téléchargé" + (ds.p.titre ? " : " + ds.p.titre : "")); download(buildPDF(renderSujet(ds), ds.p.titre || "Devoir surveille SVT"), "DS_SVT_sujet.pdf"); } }, "Télécharger le sujet (PDF)"),
           h("button", { class: "btn ghost", onclick: () => download(buildPDF(renderCorrige(ds), "Corrige et bareme"), "DS_SVT_corrige.pdf") }, "Télécharger le corrigé et le barème (PDF)"),
           h("button", { class: "btn ghost", onclick: lancer }, "Recomposer (autre tirage)")),
         h("div", { class: "card" }, h("h3", {}, "Tableau de spécification"), h("div", { class: "t-wrap" }, h("table", { class: "t" }, h("tr", {}, h("th", {}, "Capacité évaluée"), h("th", {}, "Points"), h("th", {}, "Part")),

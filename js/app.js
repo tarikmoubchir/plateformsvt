@@ -10,7 +10,7 @@
   // db = tous les comptes de l'appareil (élèves, classes ajoutées, professeur actif) ; st = le compte élève en cours.
   const vide = () => ({ eleve: null, statut: null, paliers: {}, quiz: {}, caps: {} });
   const today = () => new Date().toISOString().slice(0, 10);
-  let db = { eleves: [], courant: null, classes: {}, prof: S.professeurs[0].id, stag: [], stagCourant: null };
+  let db = { eleves: [], courant: null, classes: {}, prof: S.professeurs[0].id, stag: [], stagCourant: null, comptes: [], profs: [], journal: [], session: null };
   try {
     const raw = JSON.parse(localStorage.getItem(KEY));
     if (raw && raw.eleves) db = Object.assign(db, raw);
@@ -19,6 +19,106 @@
       db.eleves.push(Object.assign(vide(), raw, { id: "e1", statut: "accepte", date: today() })); db.courant = "e1";
     }
   } catch (e) { /* stockage indisponible */ }
+
+  // ---------- comptes ----------
+  // Identifiant = prénom + nom collés, sans accent ni espace (un numéro s'ajoute si l'identifiant existe déjà).
+  // Mot de passe = identifiant + jjmmaa de la date de naissance. Seule une empreinte SHA-256 du mot de passe est conservée.
+  const ADMIN = { login: "tarikmoubchir", h: "5c4a1f452ed460273b7cc8e1f0ae215daee6b31fb182baebc0dd60b90c58e23c", role: "admin", prenom: "Tarik", nom: "MOUBCHIR" };
+  const ROLES = { eleve: "Élève", prof: "Professeur", crmef: "Étudiant(e) CRMEF", admin: "Administrateur", invite: "Invité" };
+  const pad2 = n => String(n).padStart(2, "0");
+  const norm = s => String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const empreinte = mdp => sha256("moubchir-svt|" + mdp);
+  const compte = () => db.session === ADMIN.login ? ADMIN : db.comptes.find(c => c.login === db.session) || null;
+  const estAdmin = () => db.session === ADMIN.login;
+  if (!compte()) { db.session = null; db.courant = null; db.stagCourant = null; } // pas de session ouverte : aucun profil actif
+  let invite = null, invStag = null; // mode invité (non enregistré) : "eleve", "prof" ou "crmef"
+
+  function sha256(str) {
+    const s = unescape(encodeURIComponent(str)), K = [], H = [], w = [], by = [];
+    for (let n = 2, c = 0; c < 64; n++) {
+      let p = true; for (let d = 2; d * d <= n; d++) if (n % d === 0) { p = false; break; }
+      if (p) { if (c < 8) H[c] = (Math.pow(n, 1 / 2) * 4294967296) | 0; K[c++] = (Math.pow(n, 1 / 3) * 4294967296) | 0; }
+    }
+    for (let i = 0; i < s.length; i++) by.push(s.charCodeAt(i));
+    const l = by.length * 8; by.push(0x80); while (by.length % 64 !== 56) by.push(0);
+    for (let i = 7; i >= 0; i--) by.push(i > 3 ? 0 : (l >>> (i * 8)) & 255);
+    const R = (x, k) => (x >>> k) | (x << (32 - k));
+    for (let j = 0; j < by.length; j += 64) {
+      for (let i = 0; i < 16; i++) w[i] = (by[j + 4 * i] << 24) | (by[j + 4 * i + 1] << 16) | (by[j + 4 * i + 2] << 8) | by[j + 4 * i + 3];
+      for (let i = 16; i < 64; i++) w[i] = (w[i - 16] + (R(w[i - 15], 7) ^ R(w[i - 15], 18) ^ (w[i - 15] >>> 3)) + w[i - 7] + (R(w[i - 2], 17) ^ R(w[i - 2], 19) ^ (w[i - 2] >>> 10))) | 0;
+      let [a, b, c, d, e, f, g, k] = H;
+      for (let i = 0; i < 64; i++) {
+        const t1 = (k + (R(e, 6) ^ R(e, 11) ^ R(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i]) | 0;
+        const t2 = ((R(a, 2) ^ R(a, 13) ^ R(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) | 0;
+        k = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+      }
+      [a, b, c, d, e, f, g, k].forEach((v, i) => { H[i] = (H[i] + v) | 0; });
+    }
+    return H.map(v => (v >>> 0).toString(16).padStart(8, "0")).join("");
+  }
+
+  // Journal d'activité consulté dans le tableau de bord (les actions de l'administrateur n'y figurent pas, sauf ses connexions).
+  function journal(action, c) {
+    c = c || compte();
+    if (c && c.role === "admin" && action !== "Connexion") return;
+    if (c && c !== ADMIN) c.derniere = today();
+    db.journal.push({ t: new Date().toISOString(), login: c ? c.login : "invité", role: c ? c.role : "invite", action });
+    if (db.journal.length > 3000) db.journal.splice(0, db.journal.length - 3000);
+  }
+  S.journal = a => { journal(a); save(); };
+
+  function lireNaissance(v) {
+    const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(String(v).trim());
+    if (!m) return null;
+    const j = +m[1], mo = +m[2], a = +m[3], d = new Date(a, mo - 1, j);
+    if (d.getDate() !== j || d.getMonth() !== mo - 1 || a < 1930 || d > new Date()) return null;
+    return { j, mo, a, txt: pad2(j) + "/" + pad2(mo) + "/" + a };
+  }
+  function creerCompte(role, id) {
+    const base = norm(id.prenom) + norm(id.nom);
+    let login = base, k = 0;
+    while (login === ADMIN.login || db.comptes.some(c => c.login === login)) login = base + (++k);
+    const c = { login, role, prenom: id.prenom, nom: id.nom, naissance: id.nais.txt, date: today(), derniere: today(), mdpAuto: true };
+    const mdp = mdpAuto(c); c.h = empreinte(mdp);
+    db.comptes.push(c);
+    journal("Création du compte", c);
+    return { c, mdp, double: login !== base };
+  }
+  // Mot de passe fabriqué à la création : identifiant + jjmmaa. Facile à deviner, d'où l'invitation à le changer.
+  const mdpAuto = c => { const [j, m, a] = c.naissance.split("/"); return c.login + j + m + a.slice(-2); };
+  const aChanger = () => { const c = compte(); return !!c && c.mdpAuto && c.role !== "admin"; };
+  // Bandeau qui invite à changer le mot de passe automatique, dès que le compte est actif.
+  const alerteMdp = tu => aChanger() ? h("p", { class: "note mi" }, tu ? "Ton compte est activé. Ton mot de passe actuel est facile à deviner (ton nom et ta date de naissance) : " : "Votre mot de passe actuel est facile à deviner (nom et date de naissance) : ",
+    h("a", { href: "#/compte" }, tu ? "change-le maintenant" : "changez-le maintenant"), ".") : null;
+  function ouvrirSession(c) {
+    quitterInvite();
+    db.session = c.login; c.derniere = today();
+    db.courant = c.role === "eleve" ? c.ref : null;
+    db.stagCourant = c.role === "crmef" ? c.ref : null;
+    if (c.role === "prof") db.prof = c.ref;
+    st = db.eleves.find(e => e.id === db.courant) || vide();
+  }
+  function connecter(login, mdp) {
+    login = login.trim().toLowerCase();
+    const c = login === ADMIN.login ? ADMIN : db.comptes.find(x => x.login === login);
+    if (!c || c.h !== empreinte(mdp.trim())) return null;
+    ouvrirSession(c); journal("Connexion", c); save();
+    return c;
+  }
+  function supprimerCompte(c) {
+    journal("Suppression du compte " + c.login);
+    if (c.role === "eleve") db.eleves = db.eleves.filter(e => e.id !== c.ref);
+    if (c.role === "crmef") db.stag = db.stag.filter(x => x.id !== c.ref);
+    if (c.role === "prof") db.profs = db.profs.filter(p => p.id !== c.ref);
+    db.comptes = db.comptes.filter(x => x !== c);
+  }
+  function quitterInvite() { invite = null; invStag = null; if (st && (st.invite || st.apercu)) st = vide(); }
+  function deconnecter() {
+    if (compte()) journal("Déconnexion");
+    db.session = null; db.courant = null; db.stagCourant = null; quitterInvite(); st = vide(); save(); aller("#/");
+  }
+  const profsTous = () => S.professeurs.concat(db.profs);
+
   let st = db.eleves.find(e => e.id === db.courant) || vide();
   const save = () => { try { localStorage.setItem(KEY, JSON.stringify(db)); } catch (e) { /* idem */ } };
   const acces = () => !!st.eleve && st.statut === "accepte";
@@ -39,6 +139,7 @@
   const idx = n => Array.from({ length: n }, (_, i) => i);
   const pct = (a, b) => b ? Math.round(100 * a / b) : 0;
   const go = p => { location.hash = p; };
+  const aller = p => { if (location.hash === p) route(); else go(p); }; // affiche la page même si l'adresse ne change pas
   S.h = h;
 
   // Index de toutes les questions, et banque commune pour le générateur de devoirs.
@@ -134,15 +235,16 @@
   const pk = (s, n) => s.id + "-P" + n;
   const valide = (s, n) => !!(st.paliers[pk(s, n)] && st.paliers[pk(s, n)].valide);
   const seqDone = s => [1, 2, 3].every(n => valide(s, n));
-  const seqOpen = s => { const i = SEQS.indexOf(s); return i === 0 || seqDone(SEQS[i - 1]); };
-  const palOpen = (s, n) => seqOpen(s) && (n === 1 || valide(s, n - 1));
+  // Invité : seule la première séquence (ou leçon) est ouverte. Aperçu de l'administrateur : tout est ouvert.
+  const seqOpen = s => { const i = SEQS.indexOf(s); return st.apercu || i === 0 || (!st.invite && seqDone(SEQS[i - 1])); };
+  const palOpen = (s, n) => st.apercu || (seqOpen(s) && (n === 1 || valide(s, n - 1)));
   // Leçons explicites du collège : e = compte élève (par défaut l'élève en cours).
   const lecons = e => (e.eleve && (S.lecons || {})[e.eleve.niveau]) || [];
   const lecOk = (l, e) => { const r = ((e || st).lecons || {})[l.id]; return !!(r && r.valide); };
-  const lecOpen = (list, l) => { const i = list.indexOf(l); return i === 0 || lecOk(list[i - 1]); };
+  const lecOpen = (list, l) => { const i = list.indexOf(l); return st.apercu || i === 0 || (!st.invite && lecOk(list[i - 1])); };
 
   // ---------- vues ----------
-  function page(...kids) { const a = document.getElementById("app"); a.innerHTML = ""; a.append(...kids.flat(Infinity).filter(Boolean)); window.scrollTo(0, 0); }
+  function page(...kids) { majEntete(); const a = document.getElementById("app"); a.innerHTML = ""; a.append(...kids.flat(Infinity).filter(Boolean)); window.scrollTo(0, 0); }
   const crumb = (...items) => h("nav", { class: "crumb", "aria-label": "Fil d’Ariane" }, items.map((it, i) => [i ? " › " : "", it[1] ? h("a", { href: it[1] }, it[0]) : h("span", {}, it[0])]));
 
   function vHome() {
@@ -153,65 +255,216 @@
       h("div", { class: "entries" },
         h("a", { class: "entry", href: "#/eleve" }, h("span", { class: "entry-i" }, "🎓"), h("strong", {}, "Je suis élève"), h("span", {}, "Suivre mon parcours : cours, exercices résolus, paliers et remédiation.")),
         h("a", { class: "entry", href: "#/prof" }, h("span", { class: "entry-i" }, "📋"), h("strong", {}, "Je suis professeur"), h("span", {}, "Consulter le cadre de référence, concevoir un devoir surveillé et suivre mes classes.")),
-        h("a", { class: "entry", href: "#/crmef" }, h("span", { class: "entry-i" }, "🏛️"), h("strong", {}, "Je suis étudiant CRMEF"), h("span", {}, "Accéder aux modules de formation du Pr. Moubchir : analyse de pratiques, évaluation et remédiation.")))),
+        h("a", { class: "entry", href: "#/crmef" }, h("span", { class: "entry-i" }, "🏛️"), h("strong", {}, "Je suis étudiant(e) CRMEF"), h("span", {}, "Accéder aux modules de formation du Pr. Moubchir : analyse de pratiques, évaluation et remédiation.")))),
       h("section", { class: "cycle" }, ["Enseigner par l’inversion", "Évaluer", "Analyser les difficultés", "Remédier", "Vérifier les progrès"].map((t, i) => h("div", { class: "step" }, h("b", {}, i + 1), t))));
   }
 
+  // ---------- accès : connexion, création de compte, mode invité ----------
+  const ESPACES = {
+    eleve: { titre: "Espace élève", tu: true, insc: "#/eleve/inscription", invite: "Consulter la première séquence du premier chapitre de ton niveau, sans créer de compte. Rien n’est enregistré." },
+    prof: { titre: "Espace professeur", tu: false, insc: "#/prof/inscription", invite: "Consulter le cadre référentiel de l’évaluation, sans créer de compte." },
+    crmef: { titre: "Espace étudiant(e) CRMEF", tu: false, insc: "#/crmef/inscription", invite: "Consulter la première partie du premier module, sans créer de compte. Rien n’est enregistré." }
+  };
+  const selNiveau = id => h("select", { id }, S.niveaux.map(n => h("option", { value: n.id, disabled: !n.actif }, n.nom + (n.actif ? "" : " — bientôt"))));
+  const accueilDe = c => c.role === "admin" ? "#/admin" : "#/" + c.role;
+
+  function formConnexion() {
+    const id = h("input", { type: "text", id: "lg", autocomplete: "username", autocapitalize: "none", spellcheck: "false", placeholder: "exemple : tarikmoubchir" });
+    const mdp = h("input", { type: "password", id: "pw", autocomplete: "current-password" }), err = h("p", { class: "err", role: "alert" });
+    return h("form", { class: "card form", onsubmit: e => {
+      e.preventDefault();
+      const c = connecter(id.value, mdp.value);
+      if (!c) { err.textContent = "Nom d’utilisateur ou mot de passe incorrect."; mdp.value = ""; return; }
+      aller(accueilDe(c));
+    } }, h("h2", {}, "J’ai déjà un compte"), h("label", { for: "lg" }, "Nom d’utilisateur"), id, h("label", { for: "pw" }, "Mot de passe"), mdp, err, h("button", { class: "btn" }, "Se connecter"));
+  }
+
+  // Page d'entrée d'un espace quand personne n'est connecté.
+  function vPorte(role) {
+    const E = ESPACES[role], niv = role === "eleve" ? selNiveau("g-niv") : null;
+    page(crumb(["Accueil", "#/"], [E.titre]), h("h1", {}, E.titre),
+      h("div", { class: "two" }, formConnexion(),
+        h("div", { class: "card" }, h("h2", {}, "Je n’ai pas de compte"),
+          h("p", {}, E.tu ? "Crée ton compte avec ton prénom, ton nom et ta date de naissance : ton nom d’utilisateur et ton mot de passe sont fabriqués automatiquement." : "Créez votre compte avec votre prénom, votre nom et votre date de naissance : le nom d’utilisateur et le mot de passe sont fabriqués automatiquement."),
+          h("a", { class: "btn", href: E.insc }, E.tu ? "Créer mon compte" : "Créer un compte"),
+          h("h3", { class: "sep" }, "Entrer en invité"), h("p", { class: "muted" }, E.invite),
+          niv && [h("label", { for: "g-niv", class: "lbl" }, "Mon niveau"), niv],
+          h("button", { class: "btn ghost", onclick: () => entrerInvite(role, niv && niv.value) }, "Entrer en invité"))));
+  }
+  function entrerInvite(role, niveau) {
+    quitterInvite(); invite = role;
+    if (role === "eleve") st = Object.assign(vide(), { invite: true, statut: "accepte", eleve: { nom: "invité", niveau, classe: "Mode invité", prof: "—" } });
+    if (role === "crmef") invStag = { id: "invite", nom: "invité", cycle: "Mode invité", parts: {}, invite: true };
+    journal("Entrée en invité — espace " + ROLES[role].toLowerCase() + (niveau ? " (" + niveau + ")" : "")); save();
+    aller("#/" + role);
+  }
+  // Rubrique réservée aux inscrits, demandée par un invité.
+  function vBloque(role) {
+    const E = ESPACES[role];
+    page(crumb(["Accueil", "#/"], [E.titre, "#/" + role], ["Accès réservé"]), h("h1", {}, "Accès réservé aux inscrits"),
+      h("div", { class: "card result ko" }, h("p", {}, E.tu ? "En mode invité, tu peux seulement consulter la première séquence du premier chapitre. Crée ton compte pour accéder à tout le parcours et garder ta progression."
+        : role === "prof" ? "En mode invité, seul le cadre référentiel est consultable. Créez votre compte pour concevoir des devoirs surveillés et suivre vos classes."
+          : "En mode invité, seule la première partie du premier module est consultable. Créez votre compte pour accéder à tous les modules et garder votre progression."),
+        h("a", { class: "btn", href: E.insc }, E.tu ? "Créer mon compte" : "Créer un compte"),
+        h("button", { class: "btn ghost", onclick: () => { quitterInvite(); aller("#/" + role); } }, "J’ai déjà un compte"),
+        h("a", { class: "btn ghost", href: "#/" + role }, "Revenir")));
+  }
+  // Connecté avec un compte d'un autre espace.
+  function vAutreRole(c, role) {
+    page(crumb(["Accueil", "#/"], [ESPACES[role].titre]), h("h1", {}, ESPACES[role].titre),
+      h("div", { class: "card" }, h("p", {}, "Vous êtes connecté avec le compte « " + c.login + " » (" + ROLES[c.role].toLowerCase() + "). Pour entrer dans cet espace, déconnectez-vous puis connectez-vous avec le compte correspondant."),
+        h("a", { class: "btn", href: accueilDe(c) }, "Aller à mon espace"), h("button", { class: "btn ghost", onclick: deconnecter }, "Se déconnecter")));
+  }
+  function vConnexion() {
+    const c = compte();
+    if (c) return aller(accueilDe(c));
+    page(crumb(["Accueil", "#/"], ["Connexion"]), h("h1", {}, "Connexion"),
+      h("div", { class: "two" }, formConnexion(),
+        h("div", { class: "card" }, h("h2", {}, "Pas encore de compte ?"), h("p", {}, "Choisissez votre espace pour créer un compte :"),
+          h("a", { class: "btn", href: "#/eleve/inscription" }, "Je suis élève"), h("a", { class: "btn ghost", href: "#/prof/inscription" }, "Je suis professeur"), h("a", { class: "btn ghost", href: "#/crmef/inscription" }, "Je suis étudiant(e) CRMEF"))));
+  }
+
+  // Champs prénom, nom, date de naissance, communs aux trois inscriptions.
+  function champsIdentite(tu) {
+    const pre = h("input", { type: "text", id: "i-pre", autocomplete: "given-name" }), nom = h("input", { type: "text", id: "i-nom", autocomplete: "family-name" });
+    const nais = h("input", { type: "text", id: "i-nais", placeholder: "jj/mm/aaaa", inputmode: "numeric", maxlength: "10", autocomplete: "bday" });
+    const prevu = h("p", { class: "muted small", "aria-live": "polite" });
+    const maj = () => { const b = norm(pre.value) + norm(nom.value); prevu.textContent = b ? "Nom d’utilisateur prévu : " + b : ""; };
+    pre.addEventListener("input", maj); nom.addEventListener("input", maj);
+    nais.addEventListener("input", () => { // les barres obliques s'ajoutent toutes seules
+      const d = nais.value.replace(/\D/g, "").slice(0, 8);
+      nais.value = d.length > 4 ? d.slice(0, 2) + "/" + d.slice(2, 4) + "/" + d.slice(4) : d.length > 2 ? d.slice(0, 2) + "/" + d.slice(2) : d;
+    });
+    return {
+      els: [h("label", { for: "i-pre" }, "Prénom"), pre, h("label", { for: "i-nom" }, "Nom"), nom, prevu, h("label", { for: "i-nais" }, "Date de naissance (jj/mm/aaaa)"), nais],
+      lire(err) {
+        if (!norm(pre.value) || !norm(nom.value)) { err.textContent = tu ? "Indique ton prénom et ton nom, en lettres latines." : "Indiquez votre prénom et votre nom, en lettres latines."; return null; }
+        const n = lireNaissance(nais.value);
+        if (!n) { err.textContent = "Date de naissance invalide : écrire jour/mois/année, par exemple 06/03/1984."; return null; }
+        const p = pre.value.trim().replace(/\s+/g, " ");
+        return { prenom: p.charAt(0).toUpperCase() + p.slice(1), nom: nom.value.trim().replace(/\s+/g, " ").toUpperCase(), nais: n };
+      }
+    };
+  }
+  // Écran affiché juste après la création du compte.
+  function vIdentifiants(r, suite) {
+    page(crumb(["Accueil", "#/"], ["Compte créé"]), h("h1", {}, "Votre compte est créé"),
+      h("div", { class: "card result ok" },
+        h("p", {}, "Notez bien ces deux informations : elles servent à se reconnecter, depuis n’importe quelle page, avec le bouton « Connexion »."),
+        h("dl", { class: "ids" }, h("dt", {}, "Nom d’utilisateur"), h("dd", {}, h("code", {}, r.c.login)), h("dt", {}, "Mot de passe"), h("dd", {}, h("code", {}, r.mdp))),
+        h("p", { class: "muted small" }, "Règle : le nom d’utilisateur est le prénom et le nom collés, sans accent ni espace ; le mot de passe est le nom d’utilisateur suivi du jour, du mois et des deux derniers chiffres de l’année de naissance."
+          + (r.double ? " Un compte portant déjà ce nom existait : un numéro a été ajouté au nom d’utilisateur." : "")),
+        h("button", { class: "btn", onclick: () => aller(suite) }, "Continuer →"),
+        h("a", { class: "btn ghost", href: "#/compte" }, "Choisir mon propre mot de passe")));
+  }
+
   function vInscription() {
+    if (compte()) return vEleve();
     let prof = null;
-    const niveau = h("select", { id: "niv" }, S.niveaux.map(n => h("option", { value: n.id, disabled: !n.actif }, n.nom + (n.actif ? "" : " — bientôt"))));
-    const nom = h("input", { type: "text", id: "nom", placeholder: "Prénom et nom", autocomplete: "name" });
+    const niveau = selNiveau("niv"), ident = champsIdentite(true);
     const rech = h("input", { type: "search", id: "rech", placeholder: "Nom du professeur ou de l’établissement" });
     const liste = h("div", { class: "profs" }), classe = h("select", { id: "cl", disabled: true }, h("option", { value: "" }, "Choisir d’abord un professeur"));
     const err = h("p", { class: "err", role: "alert" });
     function maj() {
       const t = rech.value.trim().toLowerCase();
       liste.innerHTML = "";
-      S.professeurs.filter(p => !t || (p.nom + " " + p.etablissement).toLowerCase().includes(t)).forEach(p => liste.append(
-        h("button", { type: "button", class: "prof" + (prof === p ? " on" : ""), onclick: () => { prof = p; classe.disabled = false; classe.innerHTML = ""; p.classes.forEach(c => classe.append(h("option", {}, c))); maj(); } }, h("strong", {}, p.nom), h("span", {}, p.etablissement))));
+      profsTous().filter(p => !t || (p.nom + " " + p.etablissement).toLowerCase().includes(t)).forEach(p => liste.append(
+        h("button", { type: "button", class: "prof" + (prof === p ? " on" : ""), onclick: () => { prof = p; classe.disabled = false; classe.innerHTML = ""; (p.classes.length ? p.classes : ["À répartir par le professeur"]).forEach(c => classe.append(h("option", {}, c))); maj(); } }, h("strong", {}, p.nom), h("span", {}, p.etablissement))));
       if (!liste.children.length) liste.append(h("p", { class: "muted" }, "Aucun professeur trouvé."));
     }
     rech.addEventListener("input", maj); maj();
-    page(crumb(["Accueil", "#/"], ["Inscription élève"]),
-      h("h1", {}, "Mon inscription"),
+    page(crumb(["Accueil", "#/"], ["Espace élève", "#/eleve"], ["Créer mon compte"]),
+      h("h1", {}, "Créer mon compte élève"),
       h("form", { class: "card form", onsubmit: e => {
         e.preventDefault();
-        if (!nom.value.trim()) { err.textContent = "Indique ton prénom et ton nom."; return; }
+        const id = ident.lire(err); if (!id) return;
         if (!prof) { err.textContent = "Choisis ton professeur dans la liste."; return; }
-        st = Object.assign(vide(), { id: "e" + Date.now(), statut: "attente", date: today(), eleve: { nom: nom.value.trim(), niveau: niveau.value, prof: prof.nom, profId: prof.id, classe: classe.value } });
-        db.eleves.push(st); db.courant = st.id;
-        save(); go("#/eleve"); vEleve();
+        const r = creerCompte("eleve", id);
+        quitterInvite();
+        st = Object.assign(vide(), { id: "e" + Date.now(), statut: "attente", date: today(), eleve: { nom: id.prenom + " " + id.nom, niveau: niveau.value, prof: prof.nom, profId: prof.id, classe: classe.value } });
+        r.c.ref = st.id; db.eleves.push(st); ouvrirSession(r.c);
+        save(); vIdentifiants(r, "#/eleve");
       } },
-        h("label", { for: "niv" }, "1. Mon niveau scolaire"), niveau,
-        h("label", { for: "nom" }, "2. Mon identité"), nom,
+        h("fieldset", {}, h("legend", {}, "1. Mon identité"), ident.els),
+        h("label", { for: "niv" }, "2. Mon niveau scolaire"), niveau,
         h("label", { for: "rech" }, "3. Je cherche mon professeur pour rejoindre sa liste de classe inversée"), rech, liste,
         h("label", { for: "cl" }, "4. Ma classe"), classe,
-        err, h("button", { class: "btn" }, "Envoyer ma demande d’inscription"),
-        h("p", { class: "muted" }, "Ta demande sera envoyée à ton professeur : le parcours s’ouvre dès qu’il l’accepte.")));
+        err, h("button", { class: "btn" }, "Créer mon compte et envoyer ma demande"),
+        h("p", { class: "muted" }, "Ton nom d’utilisateur et ton mot de passe s’affichent juste après. Ta demande est envoyée à ton professeur : le parcours s’ouvre dès qu’il l’accepte.")));
   }
 
-  const quitter = () => { db.courant = null; st = vide(); save(); };
-  function vProfils() {
-    const lib = { attente: "demande en attente", accepte: "inscription acceptée", refuse: "demande refusée" };
-    page(crumb(["Accueil", "#/"], ["Espace élève"]), h("h1", {}, "Qui es-tu ?"),
-      h("div", { class: "profs" }, db.eleves.map(e => h("button", { type: "button", class: "prof", onclick: () => { db.courant = e.id; st = e; save(); vEleve(); } }, h("strong", {}, e.eleve.nom), h("span", {}, e.eleve.classe + " · " + e.eleve.prof + " · " + lib[e.statut])))),
-      h("a", { class: "btn", href: "#/eleve/inscription" }, "Nouvelle inscription"));
+  function vInscriptionProf() {
+    if (compte()) return vProf();
+    const ident = champsIdentite(false), etab = h("input", { type: "text", id: "p-etab" }), cls = h("input", { type: "text", id: "p-cl", placeholder: "exemple : 2BAC SPC-F 1, 1AC-3" }), err = h("p", { class: "err", role: "alert" });
+    page(crumb(["Accueil", "#/"], ["Espace professeur", "#/prof"], ["Créer un compte"]), h("h1", {}, "Créer un compte professeur"),
+      h("form", { class: "card form", onsubmit: e => {
+        e.preventDefault();
+        const id = ident.lire(err); if (!id) return;
+        if (!etab.value.trim()) { err.textContent = "Indiquez votre établissement."; return; }
+        const r = creerCompte("prof", id);
+        r.c.ref = r.c.login;
+        db.profs.push({ id: r.c.login, nom: "Pr. " + id.prenom + " " + id.nom, etablissement: etab.value.trim(), classes: cls.value.split(/[,;]/).map(x => x.trim()).filter(Boolean) });
+        ouvrirSession(r.c); save(); vIdentifiants(r, "#/prof");
+      } },
+        h("fieldset", {}, h("legend", {}, "1. Mon identité"), ident.els),
+        h("label", { for: "p-etab" }, "2. Mon établissement"), etab,
+        h("label", { for: "p-cl" }, "3. Mes classes (séparées par des virgules, facultatif)"), cls,
+        err, h("button", { class: "btn" }, "Créer mon compte"),
+        h("p", { class: "muted" }, "Vos élèves vous trouveront dans la liste des professeurs lors de leur inscription.")));
   }
+
+  function vInscriptionCrmef() {
+    if (compte()) return vCrmef();
+    const ident = champsIdentite(false), cycle = h("select", { id: "c-cy" }, S.crmef.cycles.map(c => h("option", {}, c))), err = h("p", { class: "err", role: "alert" });
+    page(crumb(["Accueil", "#/"], ["Espace CRMEF", "#/crmef"], ["Créer un compte"]), h("h1", {}, "Créer un compte étudiant(e) CRMEF"),
+      h("form", { class: "card form", onsubmit: e => {
+        e.preventDefault();
+        const id = ident.lire(err); if (!id) return;
+        const r = creerCompte("crmef", id), x = { id: "s" + Date.now(), nom: id.prenom + " " + id.nom, cycle: cycle.value, date: today(), parts: {} };
+        r.c.ref = x.id; db.stag.push(x); ouvrirSession(r.c); save(); vIdentifiants(r, "#/crmef");
+      } },
+        h("fieldset", {}, h("legend", {}, "1. Mon identité"), ident.els),
+        h("label", { for: "c-cy" }, "2. Ma filière"), cycle, err, h("button", { class: "btn" }, "Créer mon compte")));
+  }
+
+  // Bandeau et liens communs de l'espace élève.
+  function liensEleve() {
+    if (st.invite) return h("p", { class: "muted small" }, h("a", { href: "#/eleve/inscription" }, "Créer mon compte"), " · ", h("button", { class: "link", onclick: () => { quitterInvite(); aller("#/eleve"); } }, "Quitter le mode invité"));
+    if (st.apercu) return h("p", { class: "muted small" }, h("button", { class: "link", onclick: () => { st = vide(); vEleve(); } }, "Changer de niveau"), " · ", h("a", { href: "#/admin" }, "Tableau de bord"));
+    return h("p", { class: "muted small" }, h("a", { href: "#/compte" }, "Mon compte et mot de passe"), " · ", h("button", { class: "link", onclick: deconnecter }, "Se déconnecter"), " · ",
+      h("button", { class: "link", onclick: () => { if (confirm("Supprimer définitivement mon compte et ma progression ?")) { const c = compte(); if (c) supprimerCompte(c); deconnecter(); } } }, "Supprimer mon compte"));
+  }
+  const bandeau = () => st.invite ? h("p", { class: "note ko" }, "Mode invité : seule la première séquence du premier chapitre est ouverte et rien n’est enregistré. ", h("a", { href: "#/eleve/inscription" }, "Crée ton compte"), " pour accéder à tout le parcours.")
+    : st.apercu ? h("p", { class: "note ok" }, "Aperçu administrateur : toutes les leçons sont ouvertes et rien n’est enregistré.") : alerteMdp(true);
+
   function vAttente() {
     const refus = st.statut === "refuse";
     page(crumb(["Accueil", "#/"], ["Mon inscription"]), h("h1", {}, "Bonjour " + st.eleve.nom),
       h("div", { class: "card result " + (refus ? "ko" : "") }, h("h2", {}, refus ? "Demande refusée" : "Demande en attente"),
         h("p", {}, refus ? st.eleve.prof + " n’a pas accepté ta demande. Vérifie le professeur choisi, puis refais une inscription." : "Ta demande a été envoyée à " + st.eleve.prof + " pour la classe " + st.eleve.classe + ". Ton parcours s’ouvrira dès qu’elle sera acceptée."),
-        refus && h("button", { class: "btn", onclick: () => { db.eleves = db.eleves.filter(e => e !== st); quitter(); go("#/eleve/inscription"); } }, "Refaire mon inscription"),
-        h("button", { class: "btn ghost", onclick: () => { quitter(); vEleve(); } }, "Changer d’élève")),
-      !refus && h("p", { class: "muted small" }, "Version de test sur un seul appareil : le professeur accepte la demande dans « Je suis professeur » › « Mes classes »."));
+        refus && h("button", { class: "btn", onclick: () => { const c = compte(); if (c) supprimerCompte(c); deconnecter(); aller("#/eleve/inscription"); } }, "Refaire mon inscription"),
+        h("button", { class: "btn ghost", onclick: deconnecter }, "Se déconnecter")),
+      !refus && h("p", { class: "muted small" }, "En attendant, tu peux consulter la première séquence en mode invité. Version de test : le professeur accepte la demande dans « Je suis professeur » › « Mes classes »."));
+  }
+
+  // Administrateur dans l'espace élève : aperçu d'un niveau, tout ouvert.
+  function vApercuChoix() {
+    const niv = selNiveau("a-niv");
+    page(crumb(["Accueil", "#/"], ["Espace élève"]), h("h1", {}, "Espace élève — aperçu"),
+      h("div", { class: "card form" }, h("p", {}, "Vous êtes connecté en administrateur. Choisissez un niveau pour voir le parcours tel qu’un élève le voit, avec toutes les leçons ouvertes."),
+        h("label", { for: "a-niv" }, "Niveau"), niv,
+        h("button", { class: "btn", onclick: () => { st = Object.assign(vide(), { apercu: true, statut: "accepte", eleve: { nom: "administrateur", niveau: niv.value, classe: "Aperçu", prof: "—" } }); vEleve(); } }, "Voir ce niveau"),
+        h("a", { class: "btn ghost", href: "#/admin" }, "Tableau de bord")));
   }
 
   function vEleve() {
-    if (!st.eleve) return db.eleves.length ? vProfils() : vInscription();
+    const c = compte();
+    if (c && c.role === "admin" && !st.apercu) return vApercuChoix();
+    if (c && c.role !== "eleve" && c.role !== "admin") return vAutreRole(c, "eleve");
+    if (!c && !st.invite) return vPorte("eleve");
+    if (!st.eleve) return c ? deconnecter() : vInscription();
     if (!acces()) return vAttente();
-    const liens = h("p", { class: "muted small" }, h("button", { class: "link", onclick: () => { quitter(); vEleve(); } }, "Changer d’élève"), " · ",
-      h("button", { class: "link", onclick: () => { if (confirm("Effacer ma progression et mon inscription sur cet appareil ?")) { db.eleves = db.eleves.filter(e => e !== st); quitter(); go("#/"); } } }, "Supprimer mon compte"));
+    const liens = liensEleve();
     const niv = S.niveaux.find(n => n.id === st.eleve.niveau) || {};
     if (!niv.banque) { // niveau sans paliers : programme officiel, leçons explicites (collège) et résumés de chapitre quand ils existent
       const prog = S.programmes[st.eleve.niveau], lec = lecons(st), res = (S.resumes || {})[st.eleve.niveau] || {};
@@ -226,10 +479,10 @@
         h("div", { class: "card who" }, h("div", {}, h("h1", {}, "Bonjour " + st.eleve.nom), h("p", { class: "muted" }, (niv.nom || "") + " · " + st.eleve.classe + " · " + st.eleve.prof)),
           lec.length ? h("div", { class: "who-r" }, h("div", { class: "meter", role: "img", "aria-label": faites + " leçons validées sur " + lec.length }, h("i", { style: "width:" + pct(faites, lec.length) + "%" })), h("span", {}, faites + " / " + lec.length + " leçons validées"),
             h("a", { class: "btn ghost", href: "#/eleve/bilan" }, "Mon bilan de compétences")) : null),
-        h("p", { class: "note " + (lec.length ? "ok" : "ko") }, lec.length ? "Ouvre un chapitre du programme ci-dessous pour accéder à ses leçons. Chaque leçon suit cinq étapes : ouverture, « je fais », « nous faisons », « tu fais », « je retiens ». La leçon suivante s’ouvre à " + S.site.seuil + " % de réussite."
+        bandeau(), h("p", { class: "note " + (lec.length ? "ok" : "ko") }, lec.length ? "Ouvre un chapitre du programme ci-dessous pour accéder à ses leçons. Chaque leçon suit cinq étapes : ouverture, « je fais », « nous faisons », « tu fais », « je retiens ». La leçon suivante s’ouvre à " + S.site.seuil + " % de réussite."
           : Object.keys(res).length ? "Voici le programme de l’année, avec un résumé de chaque chapitre. Les exercices de ce niveau sont en préparation." : "Les cours et les exercices de ce niveau sont en préparation. Voici le programme de l’année, dans l’ordre des séquences."),
         prog ? prog.unites.map((u, ui) => h("section", { class: "unite" }, h("h2", {}, u.nom), u.chapitres.map((c, ci) => {
-          const r = res[ui + "." + ci], mine = lec.filter(l => l.u === ui && l.c === ci);
+          const r = st.invite && (ui || ci) ? null : res[ui + "." + ci], mine = lec.filter(l => l.u === ui && l.c === ci);
           const fait = mine.filter(l => lecOk(l)).length;
           return h("details", { class: "card meth-card", open: mine.includes(courante) }, h("summary", {}, c.nom + (mine.length ? " — " + fait + " / " + mine.length + " leçon(s) validée(s)" : r ? " — résumé" : c.sequences.length ? " — " + c.sequences.length + " séquence(s)" : "")),
             c.sequences.length ? h("ol", {}, c.sequences.map((t, si) => seqEl(t, mine.find(l => l.s === si))))
@@ -240,10 +493,10 @@
     const total = SEQS.length * 3, faits = SEQS.reduce((a, s) => a + [1, 2, 3].filter(n => valide(s, n)).length, 0);
     page(crumb(["Accueil", "#/"], ["Mon parcours"]),
       h("div", { class: "card who" },
-        h("div", {}, h("h1", {}, "Bonjour " + st.eleve.nom), h("p", { class: "muted" }, st.eleve.classe + " · " + st.eleve.prof + " · inscription acceptée")),
+        h("div", {}, h("h1", {}, "Bonjour " + st.eleve.nom), h("p", { class: "muted" }, st.invite || st.apercu ? st.eleve.classe : st.eleve.classe + " · " + st.eleve.prof + " · inscription acceptée")),
         h("div", { class: "who-r" }, h("div", { class: "meter", role: "img", "aria-label": faits + " paliers validés sur " + total }, h("i", { style: "width:" + pct(faits, total) + "%" })), h("span", {}, faits + " / " + total + " paliers validés"),
           h("a", { class: "btn ghost", href: "#/eleve/bilan" }, "Mon bilan de compétences"))),
-      S.unites.map(u => h("section", { class: "unite" }, h("h2", {}, u.nom),
+      bandeau(), S.unites.map(u => h("section", { class: "unite" }, h("h2", {}, u.nom),
         u.chapitres.length ? u.chapitres.map(c => h("div", { class: "chap" }, h("h3", {}, c.nom),
           c.actif ? h("div", { class: "seqs" }, c.sequences.map(id => seqCard(S.sequences[id]))) : h("p", { class: "muted" }, "Chapitre en préparation.")))
           : h("p", { class: "muted" }, "Unité en préparation."))),
@@ -253,7 +506,7 @@
   function vLecon(id, tab) {
     if (!acces()) return vEleve();
     const list = lecons(st), l = list.find(x => x.id === id);
-    if (!l || !lecOpen(list, l)) return go("#/eleve");
+    if (!l || !lecOpen(list, l)) return st.invite && l ? vBloque("eleve") : go("#/eleve");
     st.lecons = st.lecons || {};
     tab = tab || "ouverture";
     const base = "#/eleve/lecon/" + id + "/", next = list[list.indexOf(l) + 1];
@@ -282,7 +535,7 @@
           let got = 0, tot = 0;
           boxes.forEach((b, i) => { const f = fs[i] || 0; showFb(b, f); record(b.q, f); got += f * b.q.pts; tot += b.q.pts; });
           const sc = pct(got, tot), ok = sc >= S.site.seuil, rec = st.lecons[id] || (st.lecons[id] = { best: 0, n: 0, valide: false });
-          rec.n++; rec.best = Math.max(rec.best, sc); rec.valide = rec.valide || ok; st.maj = today(); save();
+          rec.n++; rec.best = Math.max(rec.best, sc); rec.valide = rec.valide || ok; st.maj = today(); if (!st.apercu) journal("Leçon « " + l.titre.split(" — ")[0] + " » : " + sc + " %" + (ok ? " — validée" : "")); save();
           out.className = "card result " + (ok ? "ok" : "ko"); out.innerHTML = "";
           out.append(h("p", { class: "score" }, sc + " %"), h("h3", {}, ok ? "Leçon validée" : "Leçon non validée"),
             h("p", {}, ok ? "Bravo : tu as atteint le seuil de " + S.site.seuil + " %." : "Il faut au moins " + S.site.seuil + " %. Lis les corrections ci-dessus, reprends « Je fais » et « Nous faisons », puis recommence."),
@@ -302,13 +555,13 @@
       h("span", { class: "seq-st" }, done ? "✔ Validée" : open ? "En cours" : "🔒 Verrouillée"),
       h("strong", {}, s.titre),
       h("span", { class: "pals" }, S.paliers.map(p => h("span", { class: "pal" + (valide(s, p.n) ? " ok" : "") }, p.n + " " + p.nom))),
-      !open && h("span", { class: "muted small" }, "Se débloque quand les 3 paliers de la séquence précédente sont validés à " + S.site.seuil + " %."));
+      !open && h("span", { class: "muted small" }, st.invite ? "Réservée aux élèves inscrits." : "Se débloque quand les 3 paliers de la séquence précédente sont validés à " + S.site.seuil + " %."));
   }
 
   function vSeq(id, tab) {
     const s = S.sequences[id];
     if (!acces()) return vEleve();
-    if (!s || !seqOpen(s)) return go("#/eleve");
+    if (!s || !seqOpen(s)) return st.invite && s ? vBloque("eleve") : go("#/eleve");
     tab = tab || "cours";
     const tabs = [["cours", "L’essentiel"], ["resolu", "Exercice résolu"], s.modele && ["modele", "Modélisation"], ["quiz", "Quiz du cours"], ["paliers", "Paliers d’exercices"]].filter(Boolean);
     let content;
@@ -339,7 +592,7 @@
       h("button", { class: "btn", onclick: e => {
         let got = 0, tot = 0;
         boxes.forEach(b => { const f = grade(b.q, b.read()) || 0; showFb(b, f); record(b.q, f); got += f * b.q.pts; tot += b.q.pts; });
-        const p = pct(got, tot); st.quiz[s.id] = Math.max(st.quiz[s.id] || 0, p); save();
+        const p = pct(got, tot); st.quiz[s.id] = Math.max(st.quiz[s.id] || 0, p); if (!st.apercu) journal("Quiz du cours « " + s.titre.split(" — ")[0] + " » : " + p + " %"); save();
         out.innerHTML = ""; out.append(h("h3", {}, "Score : " + p + " %"), h("p", {}, p >= S.site.seuil ? "Très bien : tu peux passer aux paliers d’exercices." : "Relis « L’essentiel » pour les questions manquées, puis recommence."), h("a", { class: "btn ghost", href: "#/eleve/seq/" + s.id + "/paliers" }, "Aller aux paliers →"));
         e.target.remove();
       } }, "Valider mes réponses"), out);
@@ -348,7 +601,7 @@
   function vPalier(id, n, mode) {
     const s = S.sequences[id]; n = +n;
     if (!acces()) return vEleve();
-    if (!s || !palOpen(s, n)) return go("#/eleve");
+    if (!s || !palOpen(s, n)) return st.invite && s ? vBloque("eleve") : go("#/eleve");
     const p = S.paliers[n - 1], pal = s.paliers[n], key = pk(s, n), r = st.paliers[key];
     const base = "#/eleve/seq/" + id + "/p/" + n;
     const head = [crumb(["Accueil", "#/"], ["Mon parcours", "#/eleve"], [s.titre.split(" — ")[0], "#/eleve/seq/" + id + "/paliers"], ["Palier " + n]), h("h1", {}, "Palier " + n + " — " + p.nom)];
@@ -385,7 +638,7 @@
         const score = pct(got, tot), ok = score >= S.site.seuil;
         const rec = st.paliers[key] || (st.paliers[key] = { valide: false, best: 0, tentatives: [] });
         rec.tentatives.push({ d: today(), score, err }); st.maj = today();
-        rec.best = Math.max(rec.best, score); rec.valide = rec.valide || ok; rec.bloque = !ok;
+        rec.best = Math.max(rec.best, score); rec.valide = rec.valide || ok; rec.bloque = !ok; if (!st.apercu) journal("Palier " + n + " de « " + s.titre.split(" — ")[0] + " » : " + score + " %" + (ok ? " — validé" : ""));
         save(); vResultat(s, n, rec, base, head);
       } }, "Valider mon évaluation"));
   }
@@ -433,19 +686,31 @@
         SEQS.map(s => h("tr", {}, h("th", {}, s.titre.split(" — ")[0]), [1, 2, 3].map(n => { const r = st.paliers[pk(s, n)]; return h("td", {}, r ? r.best + " %" + (r.valide ? " ✔" : "") + " (" + r.tentatives.length + " tent.)" : "—"); }), h("td", {}, st.quiz[s.id] != null ? st.quiz[s.id] + " %" : "—"))))))]);
   }
 
+  // Professeur connecté (ou administrateur) ; l'invité ne voit que le cadre référentiel.
+  const profOk = () => { const c = compte(); return !!c && (c.role === "prof" || c.role === "admin"); };
   function vProf() {
+    const c = compte();
+    if (c && !profOk()) return vAutreRole(c, "prof");
+    if (!c && invite !== "prof") return vPorte("prof");
+    const verrou = !c ? "🔒 " : "";
+    const enAttente = c ? db.eleves.filter(e => e.statut === "attente" && (estAdmin() || e.eleve.profId === db.prof)).length : 0;
+    const pr = c && profsTous().find(p => p.id === db.prof);
     page(crumb(["Accueil", "#/"], ["Espace professeur"]), h("h1", {}, "Espace professeur"),
+      c ? h("p", { class: "muted" }, (estAdmin() ? "Administrateur" : pr ? pr.nom + " · " + pr.etablissement : c.prenom + " " + c.nom), " · ", estAdmin() ? null : [h("a", { href: "#/compte" }, "Mon compte"), " · "], h("button", { class: "link", onclick: deconnecter }, "Se déconnecter"))
+        : h("p", { class: "note ko" }, "Mode invité : seul le cadre référentiel est consultable. ", h("a", { href: "#/prof/inscription" }, "Créez votre compte"), " pour accéder aux autres rubriques. ", h("button", { class: "link", onclick: () => { quitterInvite(); aller("#/prof"); } }, "J’ai déjà un compte")),
+      alerteMdp(false),
       h("div", { class: "two" },
         h("a", { class: "card act big", href: "#/prof/cadre" }, h("strong", {}, "Cadre référentiel et documents administratifs"), h("span", {}, "Références et consignes utiles à la préparation et à l’exploitation des devoirs surveillés.")),
-        h("a", { class: "card act big", href: "#/prof/ds" }, h("strong", {}, "Concevoir un devoir surveillé"), h("span", {}, "Choisir les concepts, la durée et la difficulté de chaque partie et de chaque exercice : le devoir est composé à partir de la banque commune et téléchargeable en PDF.")),
-        h("a", { class: "card act big", href: "#/prof/classes" }, h("strong", {}, "Mes classes" + (db.eleves.some(e => e.statut === "attente") ? " — " + db.eleves.filter(e => e.statut === "attente").length + " demande(s) en attente" : "")), h("span", {}, "Accepter ou refuser les élèves qui m’ont choisi comme professeur, les répartir dans mes classes et suivre leur progression."))));
+        h("a", { class: "card act big", href: "#/prof/ds" }, h("strong", {}, verrou + "Concevoir un devoir surveillé"), h("span", {}, "Choisir les concepts, la durée et la difficulté de chaque partie et de chaque exercice : le devoir est composé à partir de la banque commune et téléchargeable en PDF.")),
+        h("a", { class: "card act big", href: "#/prof/classes" }, h("strong", {}, verrou + "Mes classes" + (enAttente ? " — " + enAttente + " demande(s) en attente" : "")), h("span", {}, "Accepter ou refuser les élèves qui m’ont choisi comme professeur, les répartir dans mes classes et suivre leur progression."))));
   }
 
   // ---------- Mes classes : demandes d'inscription, répartition, suivi de la progression ----------
   function vClasses() {
-    const prof = S.professeurs.find(p => p.id === db.prof) || S.professeurs[0];
-    const classes = prof.classes.concat(db.classes[prof.id] || []);
+    if (!estAdmin()) db.prof = compte().ref; // un professeur ne voit que ses propres élèves
+    const prof = profsTous().find(p => p.id === db.prof) || S.professeurs[0];
     const miens = db.eleves.filter(e => e.eleve.profId === prof.id), total = SEQS.length * 3;
+    const classes = [...new Set(prof.classes.concat(db.classes[prof.id] || [], miens.filter(e => e.statut === "accepte").map(e => e.eleve.classe)))];
     const ok = (e, s, n) => !!(e.paliers[pk(s, n)] && e.paliers[pk(s, n)].valide);
     const nbVal = e => SEQS.reduce((a, s) => a + [1, 2, 3].filter(n => ok(e, s, n)).length, 0);
     const refaire = () => { save(); vClasses(); };
@@ -475,7 +740,7 @@
 
     page(crumb(["Accueil", "#/"], ["Espace professeur", "#/prof"], ["Mes classes"]), h("h1", {}, "Mes classes"),
       h("div", { class: "card bar" },
-        h("label", {}, "Je suis : ", h("select", { onchange: e => { db.prof = e.target.value; refaire(); } }, S.professeurs.map(p => h("option", { value: p.id, selected: p.id === prof.id }, p.nom)))),
+        estAdmin() ? h("label", {}, "Voir les classes de : ", h("select", { onchange: e => { db.prof = e.target.value; refaire(); } }, profsTous().map(p => h("option", { value: p.id, selected: p.id === prof.id }, p.nom)))) : h("strong", {}, prof.nom),
         h("form", { class: "bar", onsubmit: e => { e.preventDefault(); const v = nouvelle.value.trim(); if (v && !classes.includes(v)) { (db.classes[prof.id] = db.classes[prof.id] || []).push(v); refaire(); } } }, nouvelle, h("button", { class: "btn small ghost" }, "Ajouter une classe"))),
 
       h("h2", {}, "Demandes d’inscription (" + attente.length + ")"),
@@ -513,15 +778,15 @@
       h("p", { class: "muted" }, "Classes sans élève : " + (classes.filter(c => !miens.some(e => e.statut === "accepte" && e.eleve.classe === c)).join(", ") || "aucune") + "."),
       refuses.length ? [h("h2", {}, "Demandes refusées ou élèves retirés (" + refuses.length + ")"), refuses.map(e => h("div", { class: "card bar" }, h("div", { class: "grow" }, h("strong", {}, e.eleve.nom), h("div", { class: "muted small" }, e.eleve.classe)),
         h("button", { class: "btn small ghost", onclick: () => { e.statut = "attente"; refaire(); } }, "Réexaminer la demande")))] : null,
-      h("h2", {}, "Mes étudiants CRMEF (" + db.stag.length + ")"),
-      db.stag.length ? h("div", { class: "card" }, h("div", { class: "t-wrap" }, h("table", { class: "t suivi" },
-        h("tr", {}, h("th", {}, "Étudiant"), h("th", {}, "Filière"), MODS.map(m => h("th", {}, "Module " + m.code + " — " + m.id)), h("th", {}, "Dernière activité")),
+      !estAdmin() ? null : h("h2", {}, "Mes étudiant(e)s CRMEF (" + db.stag.length + ")"),
+      !estAdmin() ? null : db.stag.length ? h("div", { class: "card" }, h("div", { class: "t-wrap" }, h("table", { class: "t suivi" },
+        h("tr", {}, h("th", {}, "Étudiant(e)"), h("th", {}, "Filière"), MODS.map(m => h("th", {}, "Module " + m.code + " — " + m.id)), h("th", {}, "Dernière activité")),
         db.stag.map(x => h("tr", {}, h("th", {}, x.nom), h("td", {}, x.cycle),
           MODS.map(m => h("td", {}, h("div", { class: "meter" }, h("i", { style: "width:" + pct(nbParts(x, m), m.parties.length) + "%" })), " " + nbParts(x, m) + " / " + m.parties.length + " parties",
             h("div", { class: "muted small" }, m.parties.map((_, k) => { const r = x.parts[m.id + "-" + k]; return "P" + (k + 1) + " : " + (r ? r.best + " % (" + r.n + " tent.)" : "—"); }).join(" · ")))),
           h("td", {}, x.maj || x.date || "—"))))))
-        : h("p", { class: "muted" }, "Aucun étudiant CRMEF inscrit sur cet appareil."),
-      h("p", { class: "muted small" }, "Version de test : les comptes sont ceux enregistrés sur cet appareil. En ligne, chaque professeur verra uniquement ses propres élèves après connexion."));
+        : h("p", { class: "muted" }, "Aucun(e) étudiant(e) CRMEF inscrit(e) sur cet appareil."),
+      h("p", { class: "muted small" }, "Version de test : seuls les comptes créés dans ce navigateur apparaissent ici."));
   }
   const sum = (a, f) => a.reduce((t, x) => t + f(x), 0);
 
@@ -538,32 +803,43 @@
 
   // ---------- Entrée étudiant CRMEF : modules, parties débloquées à 90 %, outil d'analyse de notes ----------
   const MODS = S.crmef.modules;
-  const stag = () => db.stag.find(x => x.id === db.stagCourant);
+  // Invité : première partie du premier module seulement. Administrateur : aperçu avec tout ouvert, rien d'enregistré.
+  const stag = () => {
+    if (invStag) return invStag;
+    if (estAdmin()) return (invStag = { id: "apercu", nom: "administrateur", cycle: "Aperçu", parts: {}, apercu: true });
+    return db.stag.find(x => x.id === db.stagCourant);
+  };
   const partOk = (sg, m, i) => !!(sg.parts[m.id + "-" + i] && sg.parts[m.id + "-" + i].valide);
-  const partOpen = (sg, m, i) => i === 0 || partOk(sg, m, i - 1);
+  const partOpen = (sg, m, i) => sg.apercu || (sg.invite ? m === MODS[0] && i === 0 : i === 0 || partOk(sg, m, i - 1));
   const nbParts = (sg, m) => m.parties.filter((_, i) => partOk(sg, m, i)).length;
 
   function vCrmef() {
+    const c = compte();
+    if (c && c.role !== "crmef" && c.role !== "admin") return vAutreRole(c, "crmef");
+    if (!c && invite !== "crmef") return vPorte("crmef");
     const sg = stag();
-    if (!sg) {
-      const nom = h("input", { type: "text", id: "c-nom", placeholder: "Prénom et nom", autocomplete: "name" }), cycle = h("select", { id: "c-cy" }, S.crmef.cycles.map(c => h("option", {}, c))), err = h("p", { class: "err", role: "alert" });
-      return page(crumb(["Accueil", "#/"], ["Espace CRMEF"]), h("h1", {}, "Espace étudiant CRMEF"),
-        db.stag.length ? [h("h2", {}, "Reprendre ma formation"), h("div", { class: "profs" }, db.stag.map(x => h("button", { type: "button", class: "prof", onclick: () => { db.stagCourant = x.id; save(); vCrmef(); } }, h("strong", {}, x.nom), h("span", {}, x.cycle))))] : null,
-        h("h2", {}, "Nouvelle inscription"),
-        h("form", { class: "card form", onsubmit: e => { e.preventDefault(); if (!nom.value.trim()) { err.textContent = "Indiquez votre prénom et votre nom."; return; } const x = { id: "s" + Date.now(), nom: nom.value.trim(), cycle: cycle.value, date: today(), parts: {} }; db.stag.push(x); db.stagCourant = x.id; save(); vCrmef(); } },
-          h("label", { for: "c-nom" }, "Mon identité"), nom, h("label", { for: "c-cy" }, "Ma filière"), cycle, err, h("button", { class: "btn" }, "Accéder aux modules")));
-    }
+    if (!sg) return deconnecter();
     page(crumb(["Accueil", "#/"], ["Espace CRMEF"]),
       h("div", { class: "card who" }, h("div", {}, h("h1", {}, "Bonjour " + sg.nom), h("p", { class: "muted" }, sg.cycle + " · Formateur : " + S.site.concepteur))),
+      sg.invite ? h("p", { class: "note ko" }, "Mode invité : seule la première partie du premier module est ouverte et rien n’est enregistré. ", h("a", { href: "#/crmef/inscription" }, "Créez votre compte"), " pour accéder à tous les modules.")
+        : sg.apercu ? h("p", { class: "note ok" }, "Aperçu administrateur : toutes les parties sont ouvertes et rien n’est enregistré.") : alerteMdp(false),
       h("h2", {}, "Mes modules"),
-      h("div", { class: "seqs" }, MODS.map(m => h("a", { class: "seq " + (nbParts(sg, m) === m.parties.length ? "done" : "open"), href: "#/crmef/" + m.id },
-        h("span", { class: "seq-st" }, "Module " + m.code + " · " + nbParts(sg, m) + " / " + m.parties.length + " parties validées"), h("strong", {}, m.titre), h("span", {}, "« " + m.devise + " »")))),
-      h("p", { class: "muted small" }, h("button", { class: "link", onclick: () => { db.stagCourant = null; save(); vCrmef(); } }, "Changer d’étudiant")));
+      h("div", { class: "seqs" }, MODS.map((m, k) => {
+        const ferme = sg.invite && k > 0;
+        return h("a", { class: "seq " + (ferme ? "lock" : nbParts(sg, m) === m.parties.length ? "done" : "open"), href: "#/crmef/" + m.id },
+          h("span", { class: "seq-st" }, ferme ? "🔒 Réservé aux inscrits" : "Module " + m.code + " · " + nbParts(sg, m) + " / " + m.parties.length + " parties validées"), h("strong", {}, m.titre), h("span", {}, "« " + m.devise + " »"));
+      })),
+      h("p", { class: "muted small" }, sg.invite ? h("button", { class: "link", onclick: () => { quitterInvite(); aller("#/crmef"); } }, "Quitter le mode invité")
+        : sg.apercu ? h("a", { href: "#/admin" }, "Tableau de bord") : h("button", { class: "link", onclick: deconnecter }, "Se déconnecter")));
   }
 
   function vModule(id, tab, arg) {
+    const c = compte();
+    if (!c && invite !== "crmef") return vPorte("crmef");
+    if (c && c.role !== "crmef" && c.role !== "admin") return vAutreRole(c, "crmef");
     const sg = stag(), m = MODS.find(x => x.id === id);
     if (!sg || !m) return go("#/crmef");
+    if (sg.invite && (m !== MODS[0] || (tab && tab !== "pres" && !(tab === "p" && +arg === 0)))) return vBloque("crmef");
     tab = tab || "pres";
     const base = "#/crmef/" + id, i = +arg;
     const tabs = [["pres", "Présentation", base + "/pres"]].concat(m.parties.map((p, k) => ["p" + k, (partOk(sg, m, k) ? "✔ " : partOpen(sg, m, k) ? "" : "🔒 ") + "Partie " + (k + 1), base + "/p/" + k]),
@@ -594,7 +870,7 @@
             let got = 0, tot = 0;
             boxes.forEach(b => { const f = grade(b.q, b.read()) || 0; showFb(b, f); got += f * b.q.pts; tot += b.q.pts; });
             const sc = pct(got, tot), rec = sg.parts[key] || (sg.parts[key] = { best: 0, n: 0, valide: false });
-            rec.n++; rec.best = Math.max(rec.best, sc); rec.valide = rec.valide || sc >= S.site.seuil; sg.maj = today(); save();
+            rec.n++; rec.best = Math.max(rec.best, sc); rec.valide = rec.valide || sc >= S.site.seuil; sg.maj = today(); if (!sg.apercu) journal("Module " + m.code + ", partie " + (i + 1) + " : " + sc + " %" + (sc >= S.site.seuil ? " — validée" : "")); save();
             const ok = sc >= S.site.seuil, suite = i + 1 < m.parties.length ? ["Partie " + (i + 2) + " →", base + "/p/" + (i + 1)] : ["Retour à mes modules", "#/crmef"];
             out.className = "card result " + (ok ? "ok" : "ko"); out.innerHTML = "";
             out.append(h("p", { class: "score" }, sc + " %"), h("h3", {}, ok ? "Partie validée" : "Partie non validée"),
@@ -634,22 +910,172 @@
     return h("div", { class: "card model" }, h("h3", {}, "Outil : analyser les notes d’un devoir"), h("p", { class: "muted" }, "Saisissez les notes sur 20, séparées par des espaces. Les décimales s’écrivent avec une virgule."), ta, out);
   }
 
+  // ---------- tableau de bord de l'administrateur ----------
+  const fmtDate = iso => { const d = new Date(iso); return pad2(d.getDate()) + "/" + pad2(d.getMonth() + 1) + "/" + d.getFullYear() + " " + pad2(d.getHours()) + ":" + pad2(d.getMinutes()); };
+  const fmtJour = s => s ? s.split("-").reverse().join("/") : "—";
+  // Avancement d'un élève : paliers (niveau avec banque d'exercices) ou leçons (collège).
+  function progEleve(e) {
+    if ((S.niveaux.find(n => n.id === e.eleve.niveau) || {}).banque) {
+      const k = SEQS.reduce((a, s) => a + [1, 2, 3].filter(n => e.paliers[pk(s, n)] && e.paliers[pk(s, n)].valide).length, 0);
+      return { k, n: SEQS.length * 3, unite: "paliers" };
+    }
+    const list = lecons(e);
+    return { k: list.filter(l => lecOk(l, e)).length, n: list.length, unite: "leçons" };
+  }
+  function vAdmin() {
+    if (!estAdmin()) return vConnexion();
+    const parRole = r => db.comptes.filter(c => c.role === r);
+    const ilYa = j => new Date(Date.now() - j * 864e5).toISOString();
+    const j7 = db.journal.filter(x => x.t >= ilYa(7));
+    const actifs = new Set(j7.filter(x => x.role !== "invite" && x.role !== "admin").map(x => x.login)).size;
+    const invites = db.journal.filter(x => x.action.startsWith("Entrée en invité")).length;
+    const eleveDe = c => db.eleves.find(e => e.id === c.ref), stagDe = c => db.stag.find(x => x.id === c.ref);
+    // toutes les évaluations enregistrées : leçons, paliers, parties CRMEF
+    const scores = [];
+    db.eleves.forEach(e => { Object.values(e.lecons || {}).forEach(r => scores.push(r.best)); Object.values(e.paliers).forEach(r => r.tentatives.forEach(t => scores.push(t.score))); });
+    db.stag.forEach(x => Object.values(x.parts).forEach(r => scores.push(r.best)));
+    const moy = scores.length ? Math.round(sum(scores, x => x) / scores.length) : null;
+    const valides = sum(db.eleves, e => progEleve(e).k);
+
+    function detail(c) {
+      if (c.role === "eleve") {
+        const e = eleveDe(c); if (!e) return "—";
+        const niv = (S.niveaux.find(n => n.id === e.eleve.niveau) || {}).nom || e.eleve.niveau, p = progEleve(e);
+        return [niv + " · " + e.eleve.classe + " · " + e.eleve.prof + " · ", h("b", {}, { attente: "en attente", accepte: "accepté", refuse: "refusé" }[e.statut]),
+          p.n ? h("div", {}, h("span", { class: "meter" }, h("i", { style: "width:" + pct(p.k, p.n) + "%" })), " " + p.k + " / " + p.n + " " + p.unite + " validé(e)s") : null];
+      }
+      if (c.role === "crmef") { const x = stagDe(c); return x ? x.cycle + " · " + MODS.map(m => m.code + " : " + nbParts(x, m) + "/" + m.parties.length).join(" · ") : "—"; }
+      if (c.role === "prof") { const p = db.profs.find(q => q.id === c.ref); return p ? p.etablissement + " · " + db.eleves.filter(e => e.eleve.profId === p.id && e.statut === "accepte").length + " élève(s) · " + db.eleves.filter(e => e.eleve.profId === p.id && e.statut === "attente").length + " demande(s)" : "—"; }
+      return "—";
+    }
+
+    // filtres des tableaux
+    const fRole = h("select", { "aria-label": "Filtrer les comptes par rôle" }, h("option", { value: "" }, "Tous les rôles"), ["eleve", "prof", "crmef"].map(r => h("option", { value: r }, ROLES[r])));
+    const fTxt = h("input", { type: "search", placeholder: "Rechercher un nom ou un identifiant", "aria-label": "Rechercher un compte" });
+    const corps = h("tbody");
+    function majComptes() {
+      const t = norm(fTxt.value);
+      corps.innerHTML = "";
+      const list = db.comptes.filter(c => (!fRole.value || c.role === fRole.value) && (!t || norm(c.login + c.prenom + c.nom).includes(t))).slice().reverse();
+      if (!list.length) corps.append(h("tr", {}, h("td", { colspan: "6", class: "muted" }, "Aucun compte.")));
+      list.forEach(c => corps.append(h("tr", {}, h("th", {}, c.login, h("div", { class: "muted small" }, c.prenom + " " + c.nom)), h("td", {}, ROLES[c.role]), h("td", {}, c.naissance),
+        h("td", {}, fmtJour(c.date), h("div", { class: "muted small" }, "activité : " + fmtJour(c.derniere))), h("td", {}, detail(c)),
+        h("td", {}, c.mdpAuto ? h("div", { class: "muted small" }, "mot de passe automatique") : h("button", { class: "link", onclick: () => {
+          if (!confirm("Remettre le mot de passe automatique de « " + c.login + " » ? (en cas d’oubli)")) return;
+          c.h = empreinte(mdpAuto(c)); c.mdpAuto = true; journal("Mot de passe de " + c.login + " réinitialisé par l’administrateur", c); save();
+          alert("Nouveau mot de passe de " + c.login + " : " + mdpAuto(c)); vAdmin();
+        } }, "Réinitialiser le mot de passe"), " ",
+          h("button", { class: "link danger", onclick: () => { if (confirm("Supprimer le compte « " + c.login + " » et toute sa progression ?")) { supprimerCompte(c); save(); vAdmin(); } } }, "Supprimer")))));
+    }
+    fRole.addEventListener("change", majComptes); fTxt.addEventListener("input", majComptes);
+
+    const jRole = h("select", { "aria-label": "Filtrer le journal par rôle" }, h("option", { value: "" }, "Toute l’activité"), ["eleve", "prof", "crmef", "invite", "admin"].map(r => h("option", { value: r }, ROLES[r])));
+    const jCorps = h("tbody");
+    function majJournal() {
+      jCorps.innerHTML = "";
+      const list = db.journal.filter(x => !jRole.value || x.role === jRole.value).slice(-150).reverse();
+      if (!list.length) jCorps.append(h("tr", {}, h("td", { colspan: "4", class: "muted" }, "Aucune activité enregistrée.")));
+      list.forEach(x => jCorps.append(h("tr", {}, h("td", { class: "nowrap" }, fmtDate(x.t)), h("th", {}, x.login), h("td", {}, ROLES[x.role] || x.role), h("td", {}, x.action))));
+    }
+    jRole.addEventListener("change", majJournal);
+    majComptes(); majJournal();
+
+    // élèves par niveau
+    const niveaux = S.niveaux.map(n => ({ n, list: db.eleves.filter(e => e.eleve.niveau === n.id) })).filter(x => x.list.length);
+
+    page(crumb(["Accueil", "#/"], ["Tableau de bord"]), h("h1", {}, "Tableau de bord de l’administrateur"),
+      h("p", { class: "muted" }, "Connecté : " + ADMIN.login + " · ", h("a", { href: "#/eleve" }, "Aperçu de l’espace élève"), " · ", h("a", { href: "#/prof/classes" }, "Classes des professeurs"), " · ", h("a", { href: "#/crmef" }, "Aperçu de l’espace CRMEF"), " · ", h("button", { class: "link", onclick: deconnecter }, "Se déconnecter")),
+      h("div", { class: "stats" },
+        h("div", { class: "stat" }, h("b", {}, parRole("eleve").length), h("span", {}, "Élèves inscrits (" + db.eleves.filter(e => e.statut === "attente").length + " en attente)")),
+        h("div", { class: "stat" }, h("b", {}, parRole("prof").length), h("span", {}, "Professeurs inscrits")),
+        h("div", { class: "stat" }, h("b", {}, parRole("crmef").length), h("span", {}, "Étudiant(e)s CRMEF inscrit(e)s")),
+        h("div", { class: "stat" }, h("b", {}, actifs), h("span", {}, "Comptes actifs ces 7 derniers jours")),
+        h("div", { class: "stat" }, h("b", {}, j7.filter(x => x.action === "Connexion" && x.role !== "admin").length), h("span", {}, "Connexions ces 7 derniers jours")),
+        h("div", { class: "stat" }, h("b", {}, invites), h("span", {}, "Visites en mode invité")),
+        h("div", { class: "stat" }, h("b", {}, scores.length), h("span", {}, "Évaluations réalisées")),
+        h("div", { class: "stat" }, h("b", {}, moy == null ? "—" : moy + " %"), h("span", {}, "Score moyen des évaluations")),
+        h("div", { class: "stat" }, h("b", {}, valides), h("span", {}, "Leçons et paliers validés"))),
+
+      niveaux.length ? [h("h2", {}, "Élèves par niveau"), h("div", { class: "card" }, h("div", { class: "t-wrap" }, h("table", { class: "t" },
+        h("tr", {}, h("th", {}, "Niveau"), h("th", {}, "Élèves"), h("th", {}, "Acceptés"), h("th", {}, "Avancement moyen")),
+        niveaux.map(x => { const acc = x.list.filter(e => e.statut === "accepte"), p = acc.map(progEleve).filter(q => q.n);
+          return h("tr", {}, h("th", {}, x.n.nom), h("td", {}, x.list.length), h("td", {}, acc.length), h("td", {}, p.length ? Math.round(sum(p, q => pct(q.k, q.n)) / p.length) + " %" : "—")); }))))] : null,
+
+      h("h2", {}, "Comptes (" + db.comptes.length + ")"),
+      h("div", { class: "card" }, h("div", { class: "bar" }, fRole, fTxt),
+        h("div", { class: "t-wrap" }, h("table", { class: "t suivi" }, h("thead", {}, h("tr", {}, h("th", {}, "Utilisateur"), h("th", {}, "Rôle"), h("th", {}, "Naissance"), h("th", {}, "Inscrit le"), h("th", {}, "Détail"), h("th", {}, ""))), corps))),
+
+      h("h2", {}, "Activité récente"),
+      h("div", { class: "card" }, h("div", { class: "bar" }, jRole, h("span", { class: "muted small" }, "150 dernières actions affichées")),
+        h("div", { class: "t-wrap" }, h("table", { class: "t" }, h("thead", {}, h("tr", {}, h("th", {}, "Date"), h("th", {}, "Utilisateur"), h("th", {}, "Rôle"), h("th", {}, "Action"))), jCorps))),
+      h("p", { class: "muted small" }, "Version de test : le tableau de bord montre les comptes et l’activité enregistrés dans ce navigateur. Pour voir les élèves de tous les appareils, il faudra une base de données en ligne."));
+  }
+
+  // ---------- Mon compte : informations et changement du mot de passe ----------
+  function vCompte() {
+    const c = compte();
+    if (!c) return vConnexion();
+    if (c.role === "admin") return aller("#/admin");
+    const tu = c.role === "eleve", err = h("p", { class: "err", role: "alert" }), out = h("div", { role: "status" });
+    const champ = (id, lib, ac) => [h("label", { for: id }, lib), h("input", { type: "password", id, autocomplete: ac })];
+    const [la, ancien] = champ("m-old", tu ? "Mon mot de passe actuel" : "Mot de passe actuel", "current-password");
+    const [ln, neuf] = champ("m-new", tu ? "Mon nouveau mot de passe" : "Nouveau mot de passe", "new-password");
+    const [lc, conf] = champ("m-conf", "Confirmer le nouveau mot de passe", "new-password");
+    page(crumb(["Accueil", "#/"], [ESPACES[c.role].titre, "#/" + c.role], ["Mon compte"]), h("h1", {}, "Mon compte"),
+      h("div", { class: "card" }, h("dl", { class: "ids" },
+        h("dt", {}, "Nom d’utilisateur"), h("dd", {}, h("code", {}, c.login)), h("dt", {}, "Nom"), h("dd", {}, c.prenom + " " + c.nom),
+        h("dt", {}, "Espace"), h("dd", {}, ROLES[c.role]), h("dt", {}, "Date de naissance"), h("dd", {}, c.naissance), h("dt", {}, "Inscription"), h("dd", {}, fmtJour(c.date)))),
+      alerteMdp(tu),
+      h("form", { class: "card form", onsubmit: e => {
+        e.preventDefault(); out.innerHTML = "";
+        if (c.h !== empreinte(ancien.value.trim())) { err.textContent = "Le mot de passe actuel est incorrect."; return; }
+        const n = neuf.value;
+        if (n.length < 8) { err.textContent = "Le nouveau mot de passe doit contenir au moins 8 caractères."; return; }
+        if (/\s/.test(n)) { err.textContent = "Le mot de passe ne doit pas contenir d’espace."; return; }
+        if (n === mdpAuto(c) || norm(n).startsWith(norm(c.prenom)) && norm(n).includes(norm(c.nom))) { err.textContent = tu ? "Choisis un mot de passe qui ne reprend pas ton nom et ton prénom." : "Choisissez un mot de passe qui ne reprend pas votre nom et votre prénom."; return; }
+        if (n !== conf.value) { err.textContent = "Les deux nouveaux mots de passe ne sont pas identiques."; return; }
+        err.textContent = ""; c.h = empreinte(n); c.mdpAuto = false; journal("Mot de passe modifié"); save();
+        ancien.value = neuf.value = conf.value = "";
+        vCompte(); document.getElementById("app").append(h("p", { class: "note ok", role: "status" }, tu ? "C’est fait : ton nouveau mot de passe est enregistré. Utilise-le à ta prochaine connexion." : "C’est fait : le nouveau mot de passe est enregistré. Utilisez-le à votre prochaine connexion."));
+      } }, h("h2", {}, "Changer mon mot de passe"),
+        h("p", { class: "muted small" }, "Au moins 8 caractères, sans espace, sans reprendre le prénom et le nom. Mélanger lettres, chiffres et un signe (par exemple @ ou !) le rend plus sûr."),
+        la, ancien, ln, neuf, lc, conf, err, h("button", { class: "btn" }, "Enregistrer le nouveau mot de passe"),
+        h("p", { class: "muted small" }, tu ? "En cas d’oubli, demande à l’administrateur de remettre ton mot de passe automatique." : "En cas d’oubli, l’administrateur peut remettre le mot de passe automatique.")),
+      out, h("a", { class: "btn ghost", href: "#/" + c.role }, "Retour à mon espace"));
+  }
+
+  function majEntete() {
+    const z = document.getElementById("compte");
+    if (!z) return;
+    const c = compte();
+    z.innerHTML = "";
+    if (c) z.append(...[c.role === "admin" && h("a", { href: "#/admin" }, "Tableau de bord"), c.role === "admin" ? h("span", { class: "qui", title: ROLES[c.role] }, "👤 " + c.login) : h("a", { class: "qui", href: "#/compte", title: "Mon compte et mot de passe" }, "👤 " + c.login), h("button", { class: "link", onclick: deconnecter }, "Déconnexion")].filter(Boolean));
+    else z.append(h("a", { href: "#/connexion" }, "Connexion"));
+  }
+
   // ---------- routage ----------
   function route() {
     const p = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
     document.querySelectorAll("header nav a").forEach(a => a.classList.toggle("on", a.getAttribute("href") === "#/" + (p[0] || "")));
+    majEntete();
     if (!p.length) return vHome();
+    if (p[0] === "connexion") return vConnexion();
+    if (p[0] === "admin") return vAdmin();
+    if (p[0] === "compte") return vCompte();
     if (p[0] === "eleve") {
-      if (p[1] === "bilan") return vBilan();
       if (p[1] === "inscription") return vInscription();
+      if (!compte() && !st.invite) return vPorte("eleve");
+      if (p[1] === "bilan") return vBilan();
       if (p[1] === "seq" && p[3] === "p") return vPalier(p[2], p[4], p[5]);
       if (p[1] === "seq") return vSeq(p[2], p[3]);
       if (p[1] === "lecon") return vLecon(p[2], p[3]);
       return vEleve();
     }
-    if (p[0] === "crmef") return p[1] ? vModule(p[1], p[2], p[3]) : vCrmef();
+    if (p[0] === "crmef") return p[1] === "inscription" ? vInscriptionCrmef() : p[1] ? vModule(p[1], p[2], p[3]) : vCrmef();
     if (p[0] === "prof") {
-      if (p[1] === "cadre") return vCadre();
+      if (p[1] === "inscription") return vInscriptionProf();
+      if (p[1] === "cadre") return profOk() || invite === "prof" ? vCadre() : vProf();
+      if ((p[1] === "classes" || p[1] === "ds") && !profOk()) return compte() ? vProf() : invite === "prof" ? vBloque("prof") : vPorte("prof");
       if (p[1] === "classes") return vClasses();
       if (p[1] === "ds") return page(crumb(["Accueil", "#/"], ["Espace professeur", "#/prof"], ["Concevoir un devoir"]), S.viewDS());
       return vProf();
