@@ -10,8 +10,10 @@
   // db = tous les comptes de l'appareil (élèves, classes ajoutées, professeur actif) ; st = le compte élève en cours.
   const vide = () => ({ eleve: null, statut: null, paliers: {}, quiz: {}, caps: {} });
   const today = () => new Date().toISOString().slice(0, 10);
+  // NUAGE : comptes et progression dans la base Supabase (js/nuage.js) ; sinon, dans ce navigateur seulement.
+  const NUAGE = !!S.api;
   let db = { eleves: [], courant: null, classes: {}, prof: S.professeurs[0].id, stag: [], stagCourant: null, comptes: [], profs: [], journal: [], session: null };
-  try {
+  if (!NUAGE) try {
     const raw = JSON.parse(localStorage.getItem(KEY));
     if (raw && raw.eleves) db = Object.assign(db, raw);
     else if (raw && raw.eleve) { // ancien format : un seul élève, accepté d'office
@@ -23,13 +25,14 @@
   // ---------- comptes ----------
   // Identifiant = prénom + nom collés, sans accent ni espace (un numéro s'ajoute si l'identifiant existe déjà).
   // Mot de passe = identifiant + jjmmaa de la date de naissance. Seule une empreinte SHA-256 du mot de passe est conservée.
-  const ADMIN = { login: "tarikmoubchir", h: "5c4a1f452ed460273b7cc8e1f0ae215daee6b31fb182baebc0dd60b90c58e23c", role: "admin", prenom: "Tarik", nom: "MOUBCHIR" };
+  // Administrateur : en ligne, c'est un compte de la base ; ADMIN ne sert qu'au mode navigateur (tests), avec une empreinte fournie par la configuration.
+  const ADMIN = { login: "tarikmoubchir", h: (S.config && S.config.adminLocal) || null, role: "admin", prenom: "Tarik", nom: "MOUBCHIR", naissance: "06/03/1984" };
   const ROLES = { eleve: "Élève", prof: "Professeur", crmef: "Étudiant(e) CRMEF", admin: "Administrateur", invite: "Invité" };
   const pad2 = n => String(n).padStart(2, "0");
   const norm = s => String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
   const empreinte = mdp => sha256("moubchir-svt|" + mdp);
-  const compte = () => db.session === ADMIN.login ? ADMIN : db.comptes.find(c => c.login === db.session) || null;
-  const estAdmin = () => db.session === ADMIN.login;
+  const compte = () => !NUAGE && db.session === ADMIN.login ? ADMIN : db.comptes.find(c => c.login === db.session) || null;
+  const estAdmin = () => { const c = compte(); return !!c && c.role === "admin"; };
   if (!compte()) { db.session = null; db.courant = null; db.stagCourant = null; } // pas de session ouverte : aucun profil actif
   let invite = null, invStag = null; // mode invité (non enregistré) : "eleve", "prof" ou "crmef"
 
@@ -61,8 +64,10 @@
   function journal(action, c) {
     c = c || compte();
     if (c && c.role === "admin" && action !== "Connexion") return;
-    if (c && c !== ADMIN) c.derniere = today();
-    db.journal.push({ t: new Date().toISOString(), login: c ? c.login : "invité", role: c ? c.role : "invite", action });
+    if (c && c.role !== "admin") c.derniere = today();
+    const x = { t: new Date().toISOString(), login: c ? c.login : "invité", role: c ? c.role : "invite", action };
+    db.journal.push(x);
+    if (NUAGE) aEnvoyer.push({ login: x.login, role: x.role, action: x.action.slice(0, 300) });
     if (db.journal.length > 3000) db.journal.splice(0, db.journal.length - 3000);
   }
   S.journal = a => { journal(a); save(); };
@@ -98,29 +103,149 @@
     if (c.role === "prof") db.prof = c.ref;
     st = db.eleves.find(e => e.id === db.courant) || vide();
   }
-  function connecter(login, mdp) {
-    login = login.trim().toLowerCase();
-    const c = login === ADMIN.login ? ADMIN : db.comptes.find(x => x.login === login);
-    if (!c || c.h !== empreinte(mdp.trim())) return null;
-    ouvrirSession(c); journal("Connexion", c); save();
+  // Renvoie le compte connecté, ou null si l'identifiant ou le mot de passe est faux (exception si le serveur est injoignable).
+  async function connecter(login, mdp) {
+    login = login.trim().toLowerCase(); mdp = mdp.trim();
+    if (!NUAGE) {
+      const c = login === ADMIN.login ? ADMIN : db.comptes.find(x => x.login === login);
+      if (!c || !c.h || c.h !== empreinte(mdp)) return null;
+      ouvrirSession(c); journal("Connexion", c); save();
+      return c;
+    }
+    try { await S.api.connecter(login, mdp); } catch (e) { if (e.status === 400) return null; throw e; }
+    quitterInvite(); await charger();
+    const c = compte();
+    if (!c) return null;
+    S.api.modifier("profils", c.id, { derniere: new Date().toISOString() }).catch(() => {});
+    journal("Connexion", c); save();
     return c;
   }
-  function supprimerCompte(c) {
+  // Création d'un compte : identifiant libre, mot de passe automatique, fiche de l'espace (élève, professeur, CRMEF).
+  async function inscrire(role, id, info) {
+    if (!NUAGE) {
+      const r = creerCompte(role, id);
+      if (role === "eleve") {
+        st = Object.assign(vide(), { id: "e" + Date.now(), statut: "attente", date: today(), eleve: { nom: id.prenom + " " + id.nom, niveau: info.niveau, prof: info.prof.nom, profId: info.prof.id, classe: info.classe } });
+        r.c.ref = st.id; db.eleves.push(st);
+      }
+      if (role === "prof") { r.c.ref = r.c.login; db.profs.push({ id: r.c.login, nom: "Pr. " + id.prenom + " " + id.nom, etablissement: info.etablissement, classes: info.classes }); }
+      if (role === "crmef") { const x = { id: "s" + Date.now(), nom: id.prenom + " " + id.nom, cycle: info.cycle, date: today(), parts: {} }; r.c.ref = x.id; db.stag.push(x); }
+      ouvrirSession(r.c); save();
+      return r;
+    }
+    const base = norm(id.prenom) + norm(id.nom);
+    for (let essai = 0; essai < 4; essai++) {
+      const login = await S.api.rpc("identifiant_libre", { base });
+      const mdp = login + pad2(id.nais.j) + pad2(id.nais.mo) + String(id.nais.a).slice(-2);
+      let s;
+      try { s = await S.api.inscrire(login, mdp); } catch (e) { if (/already|registered|exists/i.test(e.message)) continue; throw e; } // pris entre-temps : identifiant suivant
+      const row = { id: s.user.id, login, role, prenom: id.prenom, nom: id.nom, naissance: id.nais.txt };
+      if (role === "eleve") Object.assign(row, { prof_id: info.prof.id, classe: info.classe, donnees: { niveau: info.niveau, profNom: info.prof.nom } });
+      if (role === "prof") row.donnees = { etablissement: info.etablissement, classes: info.classes };
+      if (role === "crmef") row.donnees = { cycle: info.cycle };
+      await S.api.ajouter("profils", row);
+      quitterInvite(); await charger();
+      const c = compte();
+      journal("Création du compte", c); save();
+      return { c, mdp, double: login !== base };
+    }
+    throw new Error("Aucun identifiant disponible : réessayez dans un instant.");
+  }
+  async function supprimerCompte(c) {
     journal("Suppression du compte " + c.login);
+    if (NUAGE) { await envoyer(); await S.api.rpc("supprimer_compte", { cible: c.id }); }
     if (c.role === "eleve") db.eleves = db.eleves.filter(e => e.id !== c.ref);
     if (c.role === "crmef") db.stag = db.stag.filter(x => x.id !== c.ref);
     if (c.role === "prof") db.profs = db.profs.filter(p => p.id !== c.ref);
     db.comptes = db.comptes.filter(x => x !== c);
   }
+  async function reinitialiser(c) {
+    if (NUAGE) await S.api.rpc("reinitialiser_mdp", { cible: c.id, mdp: mdpAuto(c) });
+    else c.h = empreinte(mdpAuto(c));
+    c.mdpAuto = true; save();
+  }
   function quitterInvite() { invite = null; invStag = null; if (st && (st.invite || st.apercu)) st = vide(); }
-  function deconnecter() {
+  async function deconnecter() {
     if (compte()) journal("Déconnexion");
+    if (NUAGE) {
+      await envoyer().catch(() => {});
+      await S.api.deconnecter();
+      Object.assign(db, { comptes: [], eleves: [], stag: [], journal: [], classes: {} });
+    }
     db.session = null; db.courant = null; db.stagCourant = null; quitterInvite(); st = vide(); save(); aller("#/");
   }
-  const profsTous = () => S.professeurs.concat(db.profs);
+  const profsTous = () => NUAGE ? db.profs : S.professeurs.concat(db.profs);
+
+  // ---------- synchronisation avec la base en ligne ----------
+  const aEnvoyer = []; // actions du journal pas encore envoyées
+  let derniers = {}, minuterie = null, charge = 0;
+  // Ligne de la table « profils » correspondant à un compte (ce que la base enregistre).
+  function ligneDe(c) {
+    const l = { prenom: c.prenom, nom: c.nom, mdp_auto: !!c.mdpAuto };
+    if (c.role === "eleve") {
+      const e = db.eleves.find(x => x.id === c.id);
+      if (e) Object.assign(l, { statut: e.statut, classe: e.eleve.classe, donnees: { niveau: e.eleve.niveau, profNom: e.eleve.prof, paliers: e.paliers, quiz: e.quiz, caps: e.caps, lecons: e.lecons || {}, maj: e.maj || null } });
+    } else if (c.role === "crmef") {
+      const x = db.stag.find(s => s.id === c.id);
+      if (x) l.donnees = { cycle: x.cycle, parts: x.parts, maj: x.maj || null };
+    } else {
+      const p = db.profs.find(q => q.id === c.login) || {};
+      l.donnees = { etablissement: p.etablissement || "", classes: p.classes || [], classesAjoutees: db.classes[c.login] || [] };
+    }
+    return l;
+  }
+  // Charge les comptes visibles par l'utilisateur connecté (le sien ; ses élèves pour un professeur ; tous pour l'administrateur).
+  // Les données affichées ne sont remplacées qu'une fois tout reçu (une coupure en cours de route ne déconnecte personne).
+  async function charger() {
+    if (db.session) await envoyer(); // d'abord ce qui n'est pas encore parti
+    const profs = await S.api.rpc("liste_profs");
+    const n = { profs: profs.map(p => ({ id: p.login, nom: p.nom, etablissement: p.etablissement, classes: p.classes || [] })), comptes: [], eleves: [], stag: [], journal: [], classes: {}, session: null, courant: null, stagCourant: null };
+    charge = Date.now();
+    if (!(await S.api.pret())) { Object.assign(db, n); return; }
+    const login = S.api.login(), rows = await S.api.lire("profils?select=*");
+    rows.forEach(r => {
+      const d = r.donnees || {}, date = String(r.cree_le).slice(0, 10);
+      n.comptes.push({ id: r.id, login: r.login, role: r.role, prenom: r.prenom, nom: r.nom, naissance: r.naissance, date, derniere: String(r.derniere).slice(0, 10), mdpAuto: r.mdp_auto, ref: r.role === "eleve" || r.role === "crmef" ? r.id : r.login });
+      if (r.role === "eleve") n.eleves.push({ id: r.id, statut: r.statut, date, eleve: { nom: r.prenom + " " + r.nom, niveau: d.niveau, prof: d.profNom || r.prof_id, profId: r.prof_id, classe: r.classe }, paliers: d.paliers || {}, quiz: d.quiz || {}, caps: d.caps || {}, lecons: d.lecons || {}, maj: d.maj });
+      if (r.role === "crmef") n.stag.push({ id: r.id, nom: r.prenom + " " + r.nom, cycle: d.cycle, date, parts: d.parts || {}, maj: d.maj });
+      if (r.role === "prof" || r.role === "admin") n.classes[r.login] = d.classesAjoutees || [];
+    });
+    const moi = n.comptes.find(c => c.login === login);
+    if (moi && moi.role === "admin") n.journal = (await S.api.lire("journal?select=t,login,role,action&order=t.desc&limit=1000")).reverse();
+    Object.assign(db, n);
+    derniers = {}; db.comptes.forEach(c => { derniers[c.id] = JSON.stringify(ligneDe(c)); });
+    if (!moi) { await S.api.deconnecter(); return; } // compte sans fiche (supprimé) : session fermée
+    db.session = login;
+    db.courant = moi.role === "eleve" ? moi.id : null;
+    db.stagCourant = moi.role === "crmef" ? moi.id : null;
+    if (moi.role === "prof" || (moi.role === "admin" && !db.profs.some(p => p.id === db.prof))) db.prof = moi.login;
+    if (!st.apercu && !st.invite) st = db.eleves.find(e => e.id === db.courant) || vide();
+  }
+  // Envoie le journal et les fiches modifiées depuis le dernier envoi.
+  async function envoyer() {
+    clearTimeout(minuterie);
+    let ok = true;
+    const j = aEnvoyer.splice(0);
+    if (j.length) try { await S.api.ajouter("journal", j); } catch (e) { console.warn("journal", e); }
+    for (const c of db.comptes) {
+      const l = ligneDe(c), txt = JSON.stringify(l);
+      if (derniers[c.id] === txt) continue;
+      try { await S.api.modifier("profils", c.id, l); derniers[c.id] = txt; } catch (e) { ok = false; console.warn("profil", e); }
+    }
+    alerteReseau(!ok);
+  }
+  function alerteReseau(ko, msg) {
+    let z = document.getElementById("reseau");
+    if (!ko) { if (z) z.remove(); return; }
+    if (!z) { z = h("div", { id: "reseau", role: "alert" }); document.body.append(z); }
+    z.textContent = msg || "Connexion au serveur perdue : vos derniers résultats ne sont pas encore enregistrés. Vérifiez Internet ; l’envoi reprendra au prochain enregistrement.";
+  }
 
   let st = db.eleves.find(e => e.id === db.courant) || vide();
-  const save = () => { try { localStorage.setItem(KEY, JSON.stringify(db)); } catch (e) { /* idem */ } };
+  const save = () => {
+    if (NUAGE) { clearTimeout(minuterie); minuterie = setTimeout(() => envoyer().catch(() => alerteReseau(true)), 400); return; }
+    try { localStorage.setItem(KEY, JSON.stringify(db)); } catch (e) { /* idem */ }
+  };
   const acces = () => !!st.eleve && st.statut === "accepte";
 
   // ---------- utilitaires ----------
@@ -268,15 +393,27 @@
   const selNiveau = id => h("select", { id }, S.niveaux.map(n => h("option", { value: n.id, disabled: !n.actif }, n.nom + (n.actif ? "" : " — bientôt"))));
   const accueilDe = c => c.role === "admin" ? "#/admin" : "#/" + c.role;
 
+  // Formulaire qui attend le serveur : bouton bloqué pendant l'envoi (pas de double inscription), message clair si le réseau manque.
+  function envoi(bt, err, fn) {
+    return async e => {
+      e.preventDefault();
+      if (bt.disabled) return;
+      const txt = bt.textContent;
+      bt.disabled = true; bt.textContent = "Patientez…"; err.textContent = "";
+      try { await fn(); }
+      catch (x) { console.warn(x); err.textContent = x.status ? "Le serveur a refusé l’opération (" + x.message + ")." : "Impossible de joindre le serveur. Vérifiez votre connexion Internet, puis réessayez."; }
+      bt.disabled = false; bt.textContent = txt;
+    };
+  }
   function formConnexion() {
     const id = h("input", { type: "text", id: "lg", autocomplete: "username", autocapitalize: "none", spellcheck: "false", placeholder: "exemple : tarikmoubchir" });
     const mdp = h("input", { type: "password", id: "pw", autocomplete: "current-password" }), err = h("p", { class: "err", role: "alert" });
-    return h("form", { class: "card form", onsubmit: e => {
-      e.preventDefault();
-      const c = connecter(id.value, mdp.value);
+    const bt = h("button", { class: "btn" }, "Se connecter");
+    return h("form", { class: "card form", onsubmit: envoi(bt, err, async () => {
+      const c = await connecter(id.value, mdp.value);
       if (!c) { err.textContent = "Nom d’utilisateur ou mot de passe incorrect."; mdp.value = ""; return; }
       aller(accueilDe(c));
-    } }, h("h2", {}, "J’ai déjà un compte"), h("label", { for: "lg" }, "Nom d’utilisateur"), id, h("label", { for: "pw" }, "Mot de passe"), mdp, err, h("button", { class: "btn" }, "Se connecter"));
+    }) }, h("h2", {}, "J’ai déjà un compte"), h("label", { for: "lg" }, "Nom d’utilisateur"), id, h("label", { for: "pw" }, "Mot de passe"), mdp, err, bt);
   }
 
   // Page d'entrée d'un espace quand personne n'est connecté.
@@ -364,67 +501,56 @@
     const niveau = selNiveau("niv"), ident = champsIdentite(true);
     const rech = h("input", { type: "search", id: "rech", placeholder: "Nom du professeur ou de l’établissement" });
     const liste = h("div", { class: "profs" }), classe = h("select", { id: "cl", disabled: true }, h("option", { value: "" }, "Choisir d’abord un professeur"));
-    const err = h("p", { class: "err", role: "alert" });
+    const err = h("p", { class: "err", role: "alert" }), bt = h("button", { class: "btn" }, "Créer mon compte et envoyer ma demande");
     function maj() {
       const t = rech.value.trim().toLowerCase();
       liste.innerHTML = "";
       profsTous().filter(p => !t || (p.nom + " " + p.etablissement).toLowerCase().includes(t)).forEach(p => liste.append(
         h("button", { type: "button", class: "prof" + (prof === p ? " on" : ""), onclick: () => { prof = p; classe.disabled = false; classe.innerHTML = ""; (p.classes.length ? p.classes : ["À répartir par le professeur"]).forEach(c => classe.append(h("option", {}, c))); maj(); } }, h("strong", {}, p.nom), h("span", {}, p.etablissement))));
-      if (!liste.children.length) liste.append(h("p", { class: "muted" }, "Aucun professeur trouvé."));
+      if (!liste.children.length) liste.append(h("p", { class: "muted" }, NUAGE && !db.profs.length ? "Liste des professeurs indisponible : vérifie ta connexion Internet puis recharge la page." : "Aucun professeur trouvé."));
     }
     rech.addEventListener("input", maj); maj();
     page(crumb(["Accueil", "#/"], ["Espace élève", "#/eleve"], ["Créer mon compte"]),
       h("h1", {}, "Créer mon compte élève"),
-      h("form", { class: "card form", onsubmit: e => {
-        e.preventDefault();
+      h("form", { class: "card form", onsubmit: envoi(bt, err, async () => {
         const id = ident.lire(err); if (!id) return;
         if (!prof) { err.textContent = "Choisis ton professeur dans la liste."; return; }
-        const r = creerCompte("eleve", id);
-        quitterInvite();
-        st = Object.assign(vide(), { id: "e" + Date.now(), statut: "attente", date: today(), eleve: { nom: id.prenom + " " + id.nom, niveau: niveau.value, prof: prof.nom, profId: prof.id, classe: classe.value } });
-        r.c.ref = st.id; db.eleves.push(st); ouvrirSession(r.c);
-        save(); vIdentifiants(r, "#/eleve");
-      } },
+        vIdentifiants(await inscrire("eleve", id, { niveau: niveau.value, prof, classe: classe.value }), "#/eleve");
+      }) },
         h("fieldset", {}, h("legend", {}, "1. Mon identité"), ident.els),
         h("label", { for: "niv" }, "2. Mon niveau scolaire"), niveau,
         h("label", { for: "rech" }, "3. Je cherche mon professeur pour rejoindre sa liste de classe inversée"), rech, liste,
         h("label", { for: "cl" }, "4. Ma classe"), classe,
-        err, h("button", { class: "btn" }, "Créer mon compte et envoyer ma demande"),
+        err, bt,
         h("p", { class: "muted" }, "Ton nom d’utilisateur et ton mot de passe s’affichent juste après. Ta demande est envoyée à ton professeur : le parcours s’ouvre dès qu’il l’accepte.")));
   }
 
   function vInscriptionProf() {
     if (compte()) return vProf();
-    const ident = champsIdentite(false), etab = h("input", { type: "text", id: "p-etab" }), cls = h("input", { type: "text", id: "p-cl", placeholder: "exemple : 2BAC SPC-F 1, 1AC-3" }), err = h("p", { class: "err", role: "alert" });
+    const ident = champsIdentite(false), etab = h("input", { type: "text", id: "p-etab" }), cls = h("input", { type: "text", id: "p-cl", placeholder: "exemple : 2BAC SPC-F 1, 1AC-3" }), err = h("p", { class: "err", role: "alert" }), bt = h("button", { class: "btn" }, "Créer mon compte");
     page(crumb(["Accueil", "#/"], ["Espace professeur", "#/prof"], ["Créer un compte"]), h("h1", {}, "Créer un compte professeur"),
-      h("form", { class: "card form", onsubmit: e => {
-        e.preventDefault();
+      h("form", { class: "card form", onsubmit: envoi(bt, err, async () => {
         const id = ident.lire(err); if (!id) return;
         if (!etab.value.trim()) { err.textContent = "Indiquez votre établissement."; return; }
-        const r = creerCompte("prof", id);
-        r.c.ref = r.c.login;
-        db.profs.push({ id: r.c.login, nom: "Pr. " + id.prenom + " " + id.nom, etablissement: etab.value.trim(), classes: cls.value.split(/[,;]/).map(x => x.trim()).filter(Boolean) });
-        ouvrirSession(r.c); save(); vIdentifiants(r, "#/prof");
-      } },
+        vIdentifiants(await inscrire("prof", id, { etablissement: etab.value.trim(), classes: cls.value.split(/[,;]/).map(x => x.trim()).filter(Boolean) }), "#/prof");
+      }) },
         h("fieldset", {}, h("legend", {}, "1. Mon identité"), ident.els),
         h("label", { for: "p-etab" }, "2. Mon établissement"), etab,
         h("label", { for: "p-cl" }, "3. Mes classes (séparées par des virgules, facultatif)"), cls,
-        err, h("button", { class: "btn" }, "Créer mon compte"),
+        err, bt,
         h("p", { class: "muted" }, "Vos élèves vous trouveront dans la liste des professeurs lors de leur inscription.")));
   }
 
   function vInscriptionCrmef() {
     if (compte()) return vCrmef();
-    const ident = champsIdentite(false), cycle = h("select", { id: "c-cy" }, S.crmef.cycles.map(c => h("option", {}, c))), err = h("p", { class: "err", role: "alert" });
+    const ident = champsIdentite(false), cycle = h("select", { id: "c-cy" }, S.crmef.cycles.map(c => h("option", {}, c))), err = h("p", { class: "err", role: "alert" }), bt = h("button", { class: "btn" }, "Créer mon compte");
     page(crumb(["Accueil", "#/"], ["Espace CRMEF", "#/crmef"], ["Créer un compte"]), h("h1", {}, "Créer un compte étudiant(e) CRMEF"),
-      h("form", { class: "card form", onsubmit: e => {
-        e.preventDefault();
+      h("form", { class: "card form", onsubmit: envoi(bt, err, async () => {
         const id = ident.lire(err); if (!id) return;
-        const r = creerCompte("crmef", id), x = { id: "s" + Date.now(), nom: id.prenom + " " + id.nom, cycle: cycle.value, date: today(), parts: {} };
-        r.c.ref = x.id; db.stag.push(x); ouvrirSession(r.c); save(); vIdentifiants(r, "#/crmef");
-      } },
+        vIdentifiants(await inscrire("crmef", id, { cycle: cycle.value }), "#/crmef");
+      }) },
         h("fieldset", {}, h("legend", {}, "1. Mon identité"), ident.els),
-        h("label", { for: "c-cy" }, "2. Ma filière"), cycle, err, h("button", { class: "btn" }, "Créer mon compte")));
+        h("label", { for: "c-cy" }, "2. Ma filière"), cycle, err, bt));
   }
 
   // Bandeau et liens communs de l'espace élève.
@@ -432,7 +558,7 @@
     if (st.invite) return h("p", { class: "muted small" }, h("a", { href: "#/eleve/inscription" }, "Créer mon compte"), " · ", h("button", { class: "link", onclick: () => { quitterInvite(); aller("#/eleve"); } }, "Quitter le mode invité"));
     if (st.apercu) return h("p", { class: "muted small" }, h("button", { class: "link", onclick: () => { st = vide(); vEleve(); } }, "Changer de niveau"), " · ", h("a", { href: "#/admin" }, "Tableau de bord"));
     return h("p", { class: "muted small" }, h("a", { href: "#/compte" }, "Mon compte et mot de passe"), " · ", h("button", { class: "link", onclick: deconnecter }, "Se déconnecter"), " · ",
-      h("button", { class: "link", onclick: () => { if (confirm("Supprimer définitivement mon compte et ma progression ?")) { const c = compte(); if (c) supprimerCompte(c); deconnecter(); } } }, "Supprimer mon compte"));
+      h("button", { class: "link", onclick: async () => { if (!confirm("Supprimer définitivement mon compte et ma progression ?")) return; const c = compte(); try { if (c) await supprimerCompte(c); deconnecter(); } catch (x) { alert("Suppression impossible pour le moment : vérifie ta connexion Internet."); } } }, "Supprimer mon compte"));
   }
   const bandeau = () => st.invite ? h("p", { class: "note ko" }, "Mode invité : seule la première séquence du premier chapitre est ouverte et rien n’est enregistré. ", h("a", { href: "#/eleve/inscription" }, "Crée ton compte"), " pour accéder à tout le parcours.")
     : st.apercu ? h("p", { class: "note ok" }, "Aperçu administrateur : toutes les leçons sont ouvertes et rien n’est enregistré.") : alerteMdp(true);
@@ -442,7 +568,8 @@
     page(crumb(["Accueil", "#/"], ["Mon inscription"]), h("h1", {}, "Bonjour " + st.eleve.nom),
       h("div", { class: "card result " + (refus ? "ko" : "") }, h("h2", {}, refus ? "Demande refusée" : "Demande en attente"),
         h("p", {}, refus ? st.eleve.prof + " n’a pas accepté ta demande. Vérifie le professeur choisi, puis refais une inscription." : "Ta demande a été envoyée à " + st.eleve.prof + " pour la classe " + st.eleve.classe + ". Ton parcours s’ouvrira dès qu’elle sera acceptée."),
-        refus && h("button", { class: "btn", onclick: () => { const c = compte(); if (c) supprimerCompte(c); deconnecter(); aller("#/eleve/inscription"); } }, "Refaire mon inscription"),
+        refus && h("button", { class: "btn", onclick: async () => { const c = compte(); try { if (c) await supprimerCompte(c); await deconnecter(); aller("#/eleve/inscription"); } catch (x) { alert("Opération impossible pour le moment : vérifie ta connexion Internet."); } } }, "Refaire mon inscription"),
+        NUAGE && !refus ? h("button", { class: "btn", onclick: async e => { e.target.textContent = "Vérification…"; try { await charger(); } catch (x) { /* hors ligne */ } vEleve(); } }, "Ma demande a-t-elle été acceptée ?") : null,
         h("button", { class: "btn ghost", onclick: deconnecter }, "Se déconnecter")),
       !refus && h("p", { class: "muted small" }, "En attendant, tu peux consulter la première séquence en mode invité. Version de test : le professeur accepte la demande dans « Je suis professeur » › « Mes classes »."));
   }
@@ -708,7 +835,7 @@
   // ---------- Mes classes : demandes d'inscription, répartition, suivi de la progression ----------
   function vClasses() {
     if (!estAdmin()) db.prof = compte().ref; // un professeur ne voit que ses propres élèves
-    const prof = profsTous().find(p => p.id === db.prof) || S.professeurs[0];
+    const prof = profsTous().find(p => p.id === db.prof) || profsTous()[0] || S.professeurs[0];
     const miens = db.eleves.filter(e => e.eleve.profId === prof.id), total = SEQS.length * 3;
     const classes = [...new Set(prof.classes.concat(db.classes[prof.id] || [], miens.filter(e => e.statut === "accepte").map(e => e.eleve.classe)))];
     const ok = (e, s, n) => !!(e.paliers[pk(s, n)] && e.paliers[pk(s, n)].valide);
@@ -962,10 +1089,9 @@
         h("td", {}, fmtJour(c.date), h("div", { class: "muted small" }, "activité : " + fmtJour(c.derniere))), h("td", {}, detail(c)),
         h("td", {}, c.mdpAuto ? h("div", { class: "muted small" }, "mot de passe automatique") : h("button", { class: "link", onclick: () => {
           if (!confirm("Remettre le mot de passe automatique de « " + c.login + " » ? (en cas d’oubli)")) return;
-          c.h = empreinte(mdpAuto(c)); c.mdpAuto = true; journal("Mot de passe de " + c.login + " réinitialisé par l’administrateur", c); save();
-          alert("Nouveau mot de passe de " + c.login + " : " + mdpAuto(c)); vAdmin();
+          reinitialiser(c).then(() => { alert("Nouveau mot de passe de " + c.login + " : " + mdpAuto(c)); vAdmin(); }, () => alert("Réinitialisation impossible pour le moment : vérifiez la connexion Internet."));
         } }, "Réinitialiser le mot de passe"), " ",
-          h("button", { class: "link danger", onclick: () => { if (confirm("Supprimer le compte « " + c.login + " » et toute sa progression ?")) { supprimerCompte(c); save(); vAdmin(); } } }, "Supprimer")))));
+          h("button", { class: "link danger", onclick: () => { if (confirm("Supprimer le compte « " + c.login + " » et toute sa progression ?")) supprimerCompte(c).then(() => { save(); vAdmin(); }, () => alert("Suppression impossible pour le moment : vérifiez la connexion Internet.")); } }, "Supprimer")))));
     }
     fRole.addEventListener("change", majComptes); fTxt.addEventListener("input", majComptes);
 
@@ -984,7 +1110,7 @@
     const niveaux = S.niveaux.map(n => ({ n, list: db.eleves.filter(e => e.eleve.niveau === n.id) })).filter(x => x.list.length);
 
     page(crumb(["Accueil", "#/"], ["Tableau de bord"]), h("h1", {}, "Tableau de bord de l’administrateur"),
-      h("p", { class: "muted" }, "Connecté : " + ADMIN.login + " · ", h("a", { href: "#/eleve" }, "Aperçu de l’espace élève"), " · ", h("a", { href: "#/prof/classes" }, "Classes des professeurs"), " · ", h("a", { href: "#/crmef" }, "Aperçu de l’espace CRMEF"), " · ", h("button", { class: "link", onclick: deconnecter }, "Se déconnecter")),
+      h("p", { class: "muted" }, "Connecté : " + compte().login + " · ", NUAGE ? [h("button", { class: "link", onclick: async () => { try { await charger(); } catch (x) { alerteReseau(true, "Actualisation impossible : vérifiez la connexion Internet."); } vAdmin(); } }, "Actualiser"), " · ", h("a", { href: "#/compte" }, "Mon mot de passe"), " · "] : null, h("a", { href: "#/eleve" }, "Aperçu de l’espace élève"), " · ", h("a", { href: "#/prof/classes" }, "Classes des professeurs"), " · ", h("a", { href: "#/crmef" }, "Aperçu de l’espace CRMEF"), " · ", h("button", { class: "link", onclick: deconnecter }, "Se déconnecter")),
       h("div", { class: "stats" },
         h("div", { class: "stat" }, h("b", {}, parRole("eleve").length), h("span", {}, "Élèves inscrits (" + db.eleves.filter(e => e.statut === "attente").length + " en attente)")),
         h("div", { class: "stat" }, h("b", {}, parRole("prof").length), h("span", {}, "Professeurs inscrits")),
@@ -1008,40 +1134,46 @@
       h("h2", {}, "Activité récente"),
       h("div", { class: "card" }, h("div", { class: "bar" }, jRole, h("span", { class: "muted small" }, "150 dernières actions affichées")),
         h("div", { class: "t-wrap" }, h("table", { class: "t" }, h("thead", {}, h("tr", {}, h("th", {}, "Date"), h("th", {}, "Utilisateur"), h("th", {}, "Rôle"), h("th", {}, "Action"))), jCorps))),
-      h("p", { class: "muted small" }, "Version de test : le tableau de bord montre les comptes et l’activité enregistrés dans ce navigateur. Pour voir les élèves de tous les appareils, il faudra une base de données en ligne."));
+      h("p", { class: "muted small" }, NUAGE ? "Données de la base en ligne : comptes de tous les appareils, actualisées à chaque ouverture du tableau de bord." : "Version de test : le tableau de bord montre les comptes et l’activité enregistrés dans ce navigateur."));
   }
 
   // ---------- Mon compte : informations et changement du mot de passe ----------
   function vCompte() {
     const c = compte();
     if (!c) return vConnexion();
-    if (c.role === "admin") return aller("#/admin");
-    const tu = c.role === "eleve", err = h("p", { class: "err", role: "alert" }), out = h("div", { role: "status" });
+    if (c.role === "admin" && !NUAGE) return aller("#/admin");
+    const tu = c.role === "eleve", err = h("p", { class: "err", role: "alert" }), out = h("div", { role: "status" }), bt = h("button", { class: "btn" }, "Enregistrer le nouveau mot de passe");
     const champ = (id, lib, ac) => [h("label", { for: id }, lib), h("input", { type: "password", id, autocomplete: ac })];
     const [la, ancien] = champ("m-old", tu ? "Mon mot de passe actuel" : "Mot de passe actuel", "current-password");
     const [ln, neuf] = champ("m-new", tu ? "Mon nouveau mot de passe" : "Nouveau mot de passe", "new-password");
     const [lc, conf] = champ("m-conf", "Confirmer le nouveau mot de passe", "new-password");
-    page(crumb(["Accueil", "#/"], [ESPACES[c.role].titre, "#/" + c.role], ["Mon compte"]), h("h1", {}, "Mon compte"),
+    page(crumb(["Accueil", "#/"], c.role === "admin" ? ["Tableau de bord", "#/admin"] : [ESPACES[c.role].titre, "#/" + c.role], ["Mon compte"]), h("h1", {}, "Mon compte"),
       h("div", { class: "card" }, h("dl", { class: "ids" },
         h("dt", {}, "Nom d’utilisateur"), h("dd", {}, h("code", {}, c.login)), h("dt", {}, "Nom"), h("dd", {}, c.prenom + " " + c.nom),
         h("dt", {}, "Espace"), h("dd", {}, ROLES[c.role]), h("dt", {}, "Date de naissance"), h("dd", {}, c.naissance), h("dt", {}, "Inscription"), h("dd", {}, fmtJour(c.date)))),
       alerteMdp(tu),
-      h("form", { class: "card form", onsubmit: e => {
-        e.preventDefault(); out.innerHTML = "";
-        if (c.h !== empreinte(ancien.value.trim())) { err.textContent = "Le mot de passe actuel est incorrect."; return; }
+      h("form", { class: "card form", onsubmit: envoi(bt, err, async () => {
+        out.innerHTML = "";
         const n = neuf.value;
         if (n.length < 8) { err.textContent = "Le nouveau mot de passe doit contenir au moins 8 caractères."; return; }
         if (/\s/.test(n)) { err.textContent = "Le mot de passe ne doit pas contenir d’espace."; return; }
         if (n === mdpAuto(c) || norm(n).startsWith(norm(c.prenom)) && norm(n).includes(norm(c.nom))) { err.textContent = tu ? "Choisis un mot de passe qui ne reprend pas ton nom et ton prénom." : "Choisissez un mot de passe qui ne reprend pas votre nom et votre prénom."; return; }
         if (n !== conf.value) { err.textContent = "Les deux nouveaux mots de passe ne sont pas identiques."; return; }
-        err.textContent = ""; c.h = empreinte(n); c.mdpAuto = false; journal("Mot de passe modifié"); save();
+        if (NUAGE) {
+          try { await S.api.connecter(c.login, ancien.value.trim()); } catch (x) { if (x.status === 400) { err.textContent = "Le mot de passe actuel est incorrect."; return; } throw x; }
+          await S.api.changerMdp(n);
+        } else {
+          if (c.h !== empreinte(ancien.value.trim())) { err.textContent = "Le mot de passe actuel est incorrect."; return; }
+          c.h = empreinte(n);
+        }
+        c.mdpAuto = false; journal("Mot de passe modifié"); save();
         ancien.value = neuf.value = conf.value = "";
         vCompte(); document.getElementById("app").append(h("p", { class: "note ok", role: "status" }, tu ? "C’est fait : ton nouveau mot de passe est enregistré. Utilise-le à ta prochaine connexion." : "C’est fait : le nouveau mot de passe est enregistré. Utilisez-le à votre prochaine connexion."));
-      } }, h("h2", {}, "Changer mon mot de passe"),
+      }) }, h("h2", {}, "Changer mon mot de passe"),
         h("p", { class: "muted small" }, "Au moins 8 caractères, sans espace, sans reprendre le prénom et le nom. Mélanger lettres, chiffres et un signe (par exemple @ ou !) le rend plus sûr."),
-        la, ancien, ln, neuf, lc, conf, err, h("button", { class: "btn" }, "Enregistrer le nouveau mot de passe"),
+        la, ancien, ln, neuf, lc, conf, err, bt,
         h("p", { class: "muted small" }, tu ? "En cas d’oubli, demande à l’administrateur de remettre ton mot de passe automatique." : "En cas d’oubli, l’administrateur peut remettre le mot de passe automatique.")),
-      out, h("a", { class: "btn ghost", href: "#/" + c.role }, "Retour à mon espace"));
+      out, h("a", { class: "btn ghost", href: accueilDe(c) }, "Retour à mon espace"));
   }
 
   function majEntete() {
@@ -1049,7 +1181,7 @@
     if (!z) return;
     const c = compte();
     z.innerHTML = "";
-    if (c) z.append(...[c.role === "admin" && h("a", { href: "#/admin" }, "Tableau de bord"), c.role === "admin" ? h("span", { class: "qui", title: ROLES[c.role] }, "👤 " + c.login) : h("a", { class: "qui", href: "#/compte", title: "Mon compte et mot de passe" }, "👤 " + c.login), h("button", { class: "link", onclick: deconnecter }, "Déconnexion")].filter(Boolean));
+    if (c) z.append(...[c.role === "admin" && h("a", { href: "#/admin" }, "Tableau de bord"), h("a", { class: "qui", href: "#/compte", title: "Mon compte et mot de passe" }, "👤 " + c.login), h("button", { class: "link", onclick: deconnecter }, "Déconnexion")].filter(Boolean));
     else z.append(h("a", { href: "#/connexion" }, "Connexion"));
   }
 
@@ -1060,6 +1192,10 @@
     majEntete();
     if (!p.length) return vHome();
     if (p[0] === "connexion") return vConnexion();
+    if (NUAGE && db.session && (p[0] === "admin" || p[1] === "classes") && Date.now() - charge > 15000) {
+      const ici = location.hash;
+      charger().then(() => { if (location.hash === ici) route(); }, () => alerteReseau(true, "Actualisation impossible : vérifiez la connexion Internet."));
+    }
     if (p[0] === "admin") return vAdmin();
     if (p[0] === "compte") return vCompte();
     if (p[0] === "eleve") {
@@ -1083,5 +1219,13 @@
     vHome();
   }
   window.addEventListener("hashchange", route);
-  window.addEventListener("DOMContentLoaded", route);
+  // En ligne : la session et les comptes sont chargés avant le premier affichage.
+  async function demarrer() {
+    if (NUAGE) {
+      page(h("p", { class: "muted" }, "Chargement…"));
+      try { await charger(); } catch (x) { console.warn(x); alerteReseau(true, "Le serveur ne répond pas : la connexion et l’inscription sont momentanément indisponibles. Vérifiez Internet puis rechargez la page."); }
+    }
+    route();
+  }
+  window.addEventListener("DOMContentLoaded", demarrer);
 })();
